@@ -19,4 +19,4 @@ Personal macOS setup — my dotfiles, scripts, and preferences for easy initiali
 
 ### (Re)generate a new SSH key and copy it to the clipboard for adding to GitHub
 
-    ssh-keygen -lv -f ~/.ssh/id_ed25519.pub && cat ~/.ssh/id_ed25519.pub|pbcopy
+    rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519 -q && cat ~/.ssh/id_ed25519.pub|pbcopy
