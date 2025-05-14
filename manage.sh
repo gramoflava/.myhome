@@ -19,7 +19,17 @@ EOF
 
 init() {
     echo "INFO: Starting initialization..."
+    echo "INFO: Zprofile"
+
+    if [ -e "$HOME/.zprofile" ]; then
+        echo "WARN: Zprofile already exists. Skipped."
+    else
+        ln "$BASEDIR/cfg/zprofile" "$HOME/.zprofile"
+        echo "INFO: Zprofile hardlinked into your home directory."
+    fi
+
     # Core utilities
+    echo "INFO: Core utilities"
     typeset -A brew_packages
     brew_packages=(
         bat       "Better cat with syntax highlighting"
@@ -32,17 +42,25 @@ init() {
         ffmpeg    "Media processor"
     )
 
-    LOGFILE="$HOME/.zsh_init.log"
-    exec > >(tee -a "$LOGFILE") 2>&1
-    # Install Homebrew if missing
+    # Init or install Homebrew if missing
     if ! command -v brew >/dev/null 2>&1; then
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    fi
+        echo "WARN: Homebrew not detected. Looking..."
+        if [ -x /opt/homebrew/bin/brew ]; then
+            eval "$(/opt/homebrew/bin/brew shellenv)"
+        elif [ -x /usr/local/bin/brew ]; then
+            eval "$(/usr/local/bin/brew shellenv)"
+        else
+            echo "WARN: Homebrew not found. Installing..."
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-    if [ -x /opt/homebrew/bin/brew ]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    elif [ -x /usr/local/bin/brew ]; then
-        eval "$(/usr/local/bin/brew shellenv)"
+            if [ -x /opt/homebrew/bin/brew ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -x /usr/local/bin/brew ]; then
+                eval "$(/usr/local/bin/brew shellenv)"
+            fi
+        fi
+        
+        echo "INFO: Proceeding with installation..."
     fi
 
     # Install required Brew packages
