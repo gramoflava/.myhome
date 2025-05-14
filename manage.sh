@@ -19,6 +19,8 @@ EOF
 
 init() {
     echo "INFO: Starting initialization..."
+    touch .hushlogin
+
     echo "INFO: Zprofile"
 
     if [ -e "$HOME/.zprofile" ]; then

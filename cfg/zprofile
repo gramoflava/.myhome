@@ -3,6 +3,9 @@
 setopt EXTENDED_GLOB     # Enable ^negation, etc., in glob patterns
 setopt NO_UNSET          # Error if you reference an undefined variable
 
+# Suppress spurious warnings when NO_UNSET is set
+export INSIDE_EMACS="${INSIDE_EMACS:-}"
+
 # Activate Homebrew if it exists
 if [ -x /opt/homebrew/bin/brew ]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
