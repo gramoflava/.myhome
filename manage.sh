@@ -96,13 +96,13 @@ init() {
 
 kbd_install() {
     local layout_name="$1"
-    if [ ! -d "$BASEDIR/kbd/$layout_name" ]; then
+    if [ ! -d "$BASEDIR/cfg/kbd/$layout_name" ]; then
         echo "Layout '$layout_name' not found in $BASEDIR. Skipping."
         exit 1
     fi
 
-    echo "INFO: Installing $layout_name from $BASEDIR/kbd to /Library/Keyboard Layouts/..."
-    sudo cp -r "$BASEDIR/kbd/$layout_name" "/Library/Keyboard Layouts/" && \
+    echo "INFO: Installing $layout_name from $BASEDIR/cfg/kbd to /Library/Keyboard Layouts/..."
+    sudo cp -r "$BASEDIR/cfg/kbd/$layout_name" "/Library/Keyboard Layouts/" && \
         echo "INFO: Installation completed successfully." || \
         echo "ERROR: Installation failed."
 }
