@@ -1,0 +1,42 @@
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon must end with two carriage returns
+Icon?
+
+# Thumbnails and cache
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+
+# Crash logs and diagnostic files
+*.crash
+*.diag
+
+# Temporary files
+*.swp
+*~
+
+# Editor and IDE folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Node modules (if using JavaScript)
+node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Logs
+*.log
+
+# Backup files
+*.bak
+*.tmp
