@@ -19,15 +19,40 @@ EOF
 
 init() {
     echo "INFO: Starting initialization..."
-    touch .hushlogin
 
+    # Prevent login messages ("Last login: ...")
+    touch $HOME/.hushlogin
+
+    # Install Zprofile and Zshrc if they don't exist
     echo "INFO: Zprofile"
-
-    if [ -e "$HOME/.zprofile" ]; then
-        echo "WARN: Zprofile already exists. Skipped."
+    if [ ! -f "$HOME/.zprofile" ]; then
+        echo "INFO: Creating new $HOME/.zprofile"
+        echo 'source "$HOME/.myhome/cfg/zprofile"' > "$HOME/.zprofile"
+    elif [ ! -s "$HOME/.zprofile" ]; then
+        echo "WARN: Removing linked $HOME/.zprofile"
+        echo "INFO: Creating new $HOME/.zprofile"
+        rm "$HOME/.zprofile"
+        echo 'source "$HOME/.myhome/cfg/zprofile"' > "$HOME/.zprofile"
     else
-        ln "$BASEDIR/cfg/zprofile" "$HOME/.zprofile"
-        echo "INFO: Zprofile hardlinked into your home directory."
+        echo "INFO: Adding source line to $HOME/.zprofile"
+        grep -qxF 'source "$HOME/.myhome/cfg/zprofile"' "$HOME/.zprofile" 2>/dev/null \
+            && echo "INFO: Zprofile already sourced" \
+            || sed -i '' '1s;^;source "$HOME/.myhome/cfg/zprofile"\n;' "$HOME/.zprofile"
+    fi
+
+    echo "INFO: Zshrc"
+    if [ ! -f "$HOME/.zshrc" ]; then
+        echo "INFO: Creating new $HOME/.zshrc"
+        echo 'source "$HOME/.myhome/cfg/zshrc"' > "$HOME/.zshrc"
+    elif [ ! -s "$HOME/.zshrc" ]; then
+        echo "WARN: Removing linked $HOME/.zshrc"
+        echo "INFO: Creating new $HOME/.zshrc"
+        rm "$HOME/.zshrc"
+        echo 'source "$HOME/.myhome/cfg/zshrc"' > "$HOME/.zshrc"
+    else
+        grep -qxF 'source "$HOME/.myhome/cfg/zshrc"' "$HOME/.zshrc" 2>/dev/null \
+            && echo "INFO: Zshrc already sourced" \
+            || sed -i '' '1s;^;source "$HOME/.myhome/cfg/zshrc"\n;' "$HOME/.zshrc"
     fi
 
     # Core utilities

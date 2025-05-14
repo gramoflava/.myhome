@@ -1,4 +1,6 @@
-### Base ZSH config
+### Base ZSH config for login shells
+# This file is sourced by the Automator and by the Terminal
+
 # Defaults
 setopt EXTENDED_GLOB     # Enable ^negation, etc., in glob patterns
 setopt NO_UNSET          # Error if you reference an undefined variable
@@ -25,84 +27,5 @@ export PATH="$(printf "%s:" "${extra_paths[@]}")$PATH"
 ### Interactive shell configuration
 is_interactive_shell() { [[ $- == *i* ]]; }
 if is_interactive_shell; then
-    # Global settings and Prompt
-    autoload -U colors && colors
-    PROMPT="%(?.%{$fg[green]%}%#%{$reset_color%}.%{$fg[red]%}×%{$reset_color%}) "
 
-    # Defaults for interactive
-    setopt NO_BEEP           # Disable the bell
-    setopt LIST_PACKED       # Pack long `ls`-style completion into columns
-    setopt LIST_AMBIGUOUS    # Immediately show choices if completion is ambiguous
-    setopt AUTO_PARAM_SLASH  # Add a “/” after directory names when completing
-
-    # History
-    setopt EXTENDED_HISTORY         # Save timestamp and duration
-    setopt SHARE_HISTORY            # Share history between sessions
-    setopt INC_APPEND_HISTORY       # Add commands to history immediately
-    setopt HIST_VERIFY              # Don't execute immediately upon history expansion
-    setopt HIST_IGNORE_DUPS         # Don't record duplicates
-    setopt HIST_IGNORE_SPACE        # Don’t record commands that start with a space
-    setopt HIST_FIND_NO_DUPS        # Don't show duplicates in search
-    setopt HIST_REDUCE_BLANKS       # Remove unnecessary blanks
-
-    # History file configuration
-    export HISTFILE=~/.histfile
-    export HISTSIZE=1000            # History in memory
-    export SAVEHIST=1000            # History on disk
-    export HIST_IGNORE_PATTERN="(ls|cd|pwd|exit|cd ..)"  # Don't record common commands
-
-    # Editor/Pager
-    export EDITOR='vim'
-    export VISUAL='code'            # VS Code as visual editor
-    export PAGER='less'
-    export LESS='-R -M -i -j.5'     # Better less defaults:
-                                    # -R:   Show colors
-                                    # -M:   Show detailed prompt
-                                    # -i:   Case-insensitive search
-                                    # -j.5: Center on search results
-
-    # Navigation
-    setopt AUTO_CD                  # Just type directory name to cd
-    setopt AUTO_PUSHD               # Push dir to stack automatically
-    setopt PUSHD_IGNORE_DUPS        # Don't push duplicate dirs
-    setopt PUSHD_MINUS              # Use +/- operators for dir stack
-    DIRSTACKSIZE=10                 # Directory stack size
-
-    ## Completions
-    setopt CORRECT                  # Enable command correction
-    setopt CORRECT_ALL              # Argument correction
-    setopt COMPLETE_IN_WORD         # Allow completion to act in the middle of a word
-    CORRECT_IGNORE="[_|.]*"         # Don't correct files starting with _ or .
-
-    ## ZSH Completion System
-    ZSH_COMPLETIONS_PATH="$(brew --prefix zsh-completions 2>/dev/null)/share/zsh/site-functions"
-    BREW_SITE_FUNCS="$(brew --prefix)/share/zsh/site-functions"
-
-    # Add completion directories to fpath if they exist and aren't empty
-    for p in "$ZSH_COMPLETIONS_PATH" "$BREW_SITE_FUNCS"; do
-        if [ -d "$p" ] && [ "$(ls -A "$p" 2>/dev/null)" ]; then
-            fpath=("$p" $fpath)
-        fi
-    done
-
-    # Completion behavior order:
-    zstyle ':completion:*' completer _list _expand _complete _ignored _match _correct _approximate _prefix
-    zstyle ':completion:*' completions 10   # Limit completion suggestions
-    zstyle ':completion:*' glob 1           # Advanced pattern matching in completions
-
-    # Configure the prompt shown when scrolling through completion options
-    zstyle ':completion:*' list-prompt %SAt %p: Hit TAB for more, or the character to insert%s
-    zstyle ':completion:*' max-errors 2     # Errors allowed in approximate completion matching
-    zstyle ':completion:*' menu yes select  # 'Select' allows using arrow keys to select completions
-    bindkey '^I' menu-complete              # ^I (Tab): Cycle forward through completion menu
-    bindkey '^[[Z' reverse-menu-complete    # ^[[Z (Shift+Tab): Cycle backward through completion menu
-
-    zstyle ':completion:*' select-prompt %SScrolling active: current selection at %p%s  # Show current selection position in menu
-    zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file location for compinstall utility
-
-    # Load and initialize the completion system
-    # -U: Suppress alias expansion during function loading
-    # -z: Use zsh style autoloading
-    # -C: Skip security checks for faster loading
-    autoload -Uz compinit && compinit -C
 fi
