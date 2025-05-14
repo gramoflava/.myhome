@@ -29,7 +29,6 @@ export HIST_IGNORE_PATTERN="(ls|cd|pwd|exit|cd ..)"  # Don't record common comma
 
 # Editor/Pager
 export EDITOR='vim'
-export VISUAL='code'            # VS Code as visual editor
 export PAGER='less'
 export LESS='-R -M -i -j.5'     # Better less defaults:
                                 # -R:   Show colors
