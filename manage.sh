@@ -1,5 +1,4 @@
 #!/bin/zsh
-set -euo pipefail
 setopt extended_glob
 
 # Determine the directory of this script so it can be run from anywhere
