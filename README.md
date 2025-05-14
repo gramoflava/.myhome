@@ -6,7 +6,7 @@ Personal macOS setup — my dotfiles, scripts, and preferences for easy initiali
 
     /bin/bash -c \
       "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone https://github.com/gramoflava/.myhome.git ~/.myhome
+    GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:gramoflava/.myhome.git ~/.myhome
     chmod +x ~/.myhome/manage.sh && ~/.myhome/manage.sh --init
 
 ## What will happen
