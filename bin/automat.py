@@ -272,6 +272,7 @@ def main():
             "  automat.py -c h264 -f mp4 refine /path/to/directory\n\n"
             "  # Process with debug info and GPU acceleration:\n"
             "  automat.py -d -g refine myvideo.mp4\n\n"
+            ""
             "Automator Quick Action Example (macOS):\n"
             "  1. Open Automator and create a new \"Quick Action\".\n"
             "  2. Set \"Workflow receives current: files or folders\" in \"Finder.app\".\n"
@@ -281,14 +282,14 @@ def main():
             "     - Pass input: as arguments\n"
             "     - Script:\n"
             "```\n"
-            "source $HOME/.zshrc\n"
+            "source $HOME/.zprofile\n"
             "for f in \"$@\"; do\n"
-            "    $HOME/bin/automat.py -t refine \"$f\"\n"
+            "    automat.py -t refine \"$f\"\n"
             "done\n"
             "```\n"
         )
     )
-    
+
     # Command options
     p.add_argument("-v", action="store_true", 
                    help="Verbose output")
