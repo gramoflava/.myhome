@@ -71,6 +71,11 @@ def is_image_file(path) -> bool:
     res = run_command(["file", "--mime-type", "-b", str(path)])
     return res.stdout.strip().startswith("image/")
 
+def is_already_processed(path):
+    """Check if file was already processed by looking for the suffix"""
+    path = Path(path)
+    return path.stem.endswith(SUFFIX)
+
 def move_to_trash(path):
     if DRY_RUN:
         display_info(f"[DRY RUN] Would move to trash: {path}")
@@ -182,7 +187,8 @@ def build_ffmpeg_command(src, codec, fmt, bitrate):
     ]
     return cmd, out
 
-def process_video(src, codec, fmt):
+def process_video_refine(src, codec, fmt):
+    """Refine a video file by re-encoding it"""
     src = Path(src)
     w,h,dur,br,sz = get_video_info(src)
     new_br = calculate_optimal_bitrate(w,h,br,sz,dur)
@@ -199,6 +205,124 @@ def process_video(src, codec, fmt):
     new_sz = out.stat().st_size if not DRY_RUN else int(orig_sz * 0.7)  # Estimate for dry run
     red = (1-new_sz/orig_sz)*100 if orig_sz>0 else 0
     display_info(f"{orig_sz/1e6:.2f}→{new_sz/1e6:.2f} MB ({red:.1f}% reduction)")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
+
+def process_video_amv(src, audio_track, codec, fmt):
+    """Add or replace audio track in video (AMV operation)"""
+    src = Path(src)
+    audio_track = Path(audio_track)
+    out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
+    
+    if not audio_track.exists():
+        display_error(f"Audio track not found: {audio_track}")
+        return False
+    
+    # Build FFmpeg command for AMV operation
+    cmd = ["ffmpeg"]
+    if USE_GPU:
+        cmd += ["-hwaccel", "videotoolbox"]
+    
+    cmd += [
+        "-i", str(src),        # Video input
+        "-i", str(audio_track), # Audio input
+        "-c:v", "copy",        # Copy video stream as-is
+        "-c:a", "aac",         # Re-encode audio to AAC
+        "-b:a", "128k",        # Audio bitrate
+        "-map", "0:v:0",       # Map first video stream from first input
+        "-map", "1:a:0",       # Map first audio stream from second input
+        "-shortest",           # End when shortest stream ends
+        "-movflags", "+faststart",
+        "-y",
+        str(out)
+    ]
+    
+    logger.info("Running: " + " ".join(cmd))
+    res = run_command(cmd)
+    if res.returncode != 0 and not DRY_RUN:
+        display_error("ffmpeg AMV failed")
+        return False
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
+        return False
+    
+    display_info(f"AMV created: {out}")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
+
+def process_video_loop_audio(src, codec, fmt):
+    """Loop audio to match video duration"""
+    src = Path(src)
+    out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
+    
+    # Get video and audio duration info
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_format", "-show_streams", str(src)]
+    res = run_command(cmd)
+    if res.returncode != 0:
+        display_error(f"ffprobe error on {src}")
+        return False
+    
+    info = json.loads(res.stdout)
+    video_stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
+    audio_stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="audio"), {})
+    
+    if not video_stream or not audio_stream:
+        display_error(f"Missing video or audio stream in {src}")
+        return False
+    
+    video_duration = float(video_stream.get("duration", 0) or info.get("format",{}).get("duration", 0))
+    
+    # Build FFmpeg command to loop audio
+    cmd = ["ffmpeg"]
+    if USE_GPU:
+        cmd += ["-hwaccel", "videotoolbox"]
+    
+    cmd += [
+        "-stream_loop", "-1",  # Loop audio indefinitely
+        "-i", str(src),
+        "-c:v", "copy",        # Copy video as-is
+        "-c:a", "aac",         # Re-encode audio
+        "-b:a", "128k",
+        "-t", str(video_duration),  # Stop at video duration
+        "-movflags", "+faststart",
+        "-y",
+        str(out)
+    ]
+    
+    logger.info("Running: " + " ".join(cmd))
+    res = run_command(cmd)
+    if res.returncode != 0 and not DRY_RUN:
+        display_error("ffmpeg loop_audio failed")
+        return False
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
+        return False
+    
+    display_info(f"Audio looped: {out}")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
+
+def process_video_audiofy(src, codec, fmt):
+    """Extract audio from video and save as audio file"""
+    src = Path(src)
+    out = src.parent / f"{src.stem}{SUFFIX}.mp3"
+    
+    cmd = ["ffmpeg", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(out)]
+    
+    logger.info("Running: " + " ".join(cmd))
+    res = run_command(cmd)
+    if res.returncode != 0 and not DRY_RUN:
+        display_error("ffmpeg audiofy failed")
+        return False
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
+        return False
+    
+    display_info(f"Audio extracted: {out}")
     if TRASH_MODE:
         move_to_trash(src)
     return True
@@ -223,34 +347,86 @@ def process_image(src):
         move_to_trash(src)
     return True
 
+def process_single_file(file_path, operations, audio_track, codec, fmt):
+    """Process a single file with the specified operations"""
+    file_path = Path(file_path)
+    
+    # Convert to absolute path if not already
+    if not file_path.is_absolute():
+        file_path = Path(os.getcwd()) / file_path
+    
+    if not file_path.exists():
+        display_error(f"File not found: {file_path}")
+        return False
+    
+    # Skip if already processed
+    if is_already_processed(file_path):
+        display_info(f"Skipping already processed file: {file_path}")
+        return True
+    
+    success = True
+    
+    # Process based on file type and operations
+    if is_video_file(file_path):
+        display_info(f"Processing video: {file_path}")
+        
+        for operation in operations:
+            if operation == "refine":
+                if not process_video_refine(file_path, codec, fmt):
+                    success = False
+            elif operation == "amv":
+                if not audio_track:
+                    display_error("AMV operation requires audio track (-a parameter)")
+                    success = False
+                elif not process_video_amv(file_path, audio_track, codec, fmt):
+                    success = False
+            elif operation == "loop_audio":
+                if not process_video_loop_audio(file_path, codec, fmt):
+                    success = False
+            elif operation == "audiofy":
+                if not process_video_audiofy(file_path, codec, fmt):
+                    success = False
+    
+    elif is_image_file(file_path):
+        display_info(f"Processing image: {file_path}")
+        # For images, we only support the refine operation (convert to HEIC)
+        if "refine" in operations:
+            if not process_image(file_path):
+                success = False
+        else:
+            display_info(f"Skipping image (no supported operations): {file_path}")
+    
+    else:
+        display_error(f"Unsupported file type: {file_path}")
+        success = False
+    
+    return success
+
 def refine_recursively(directory, codec, fmt):
+    """Recursively process all files in directory (legacy function for compatibility)"""
     display_info(f"Recursively refining: {directory}")
     files = []
     directory = Path(directory)
     for path in directory.rglob("*"):
         if path.stem.endswith(SUFFIX):
             continue
-        if is_video_file(path):
-            kind = "video"
-        elif is_image_file(path):
-            kind = "image"
-        else:
-            continue
-        files.append((path, kind))
+        if is_video_file(path) or is_image_file(path):
+            files.append(path)
+    
     total = len(files)
     display_info(f"Found {total} files")
     proc = fail = 0
-    for idx, (path, kind) in enumerate(files,1):
-        display_info(f"[{idx}/{total}] Processing {kind}: {path}")
-        ok = process_video(path, codec, fmt) if kind=="video" else process_image(path)
-        if ok:
+    
+    for idx, path in enumerate(files, 1):
+        display_info(f"[{idx}/{total}] Processing: {path}")
+        if process_single_file(path, ["refine"], None, codec, fmt):
             display_info(f"✓ {path}")
+            proc += 1
         else:
-            fail += 1
             display_error(f"✗ {path}")
-        proc += 1
+            fail += 1
+    
     display_info(f"Done. Processed: {proc}, Failed: {fail}")
-    # Show notification when complete
     if not DRY_RUN:
         notify("Automat", f"Processed {proc} files, {fail} failed")
 
@@ -266,12 +442,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # Refine a single video with HEVC codec and move to trash:\n"
-            "  automat.py -t refine myvideo.mp4\n\n"
-            "  # Refine all media in a directory with H264 codec and .mp4 output:\n"
-            "  automat.py -c h264 -f mp4 refine /path/to/directory\n\n"
+            "  # Refine multiple videos with HEVC codec and move to trash:\n"
+            "  automat.py -t --refine video1.mp4 video2.avi video3.mkv\n\n"
+            "  # Create AMV with new audio track:\n"
+            "  automat.py --amv -a new_track.mp3 -c h264 -f mp4 video.avi\n\n"
             "  # Process with debug info and GPU acceleration:\n"
-            "  automat.py -d -g refine myvideo.mp4\n\n"
+            "  automat.py -d -g --refine myvideo.mp4\n\n"
+            "  # Multiple operations on multiple files:\n"
+            "  automat.py -t --amv --refine -a track.mp3 file1.avi file2.mkv\n\n"
             ""
             "Automator Quick Action Example (macOS):\n"
             "  1. Open Automator and create a new \"Quick Action\".\n"
@@ -283,44 +461,54 @@ def main():
             "     - Script:\n"
             "```\n"
             "source $HOME/.zprofile\n"
-            "for f in \"$@\"; do\n"
-            "    automat.py -t refine \"$f\"\n"
-            "done\n"
+            "automat.py -t --refine \"$@\"\n"
             "```\n"
         )
     )
 
-    # Command options
-    p.add_argument("-v", action="store_true", 
-                   help="Verbose output")
+    # Operation flags
+    p.add_argument("--refine", action="store_true",
+                   help="Refine/optimize video or image files")
+    p.add_argument("--amv", action="store_true",
+                   help="Add or replace audio track in video (requires -a)")
+    p.add_argument("--loop-audio", dest="loop_audio", action="store_true",
+                   help="Loop audio to match video duration")
+    p.add_argument("--audiofy", action="store_true",
+                   help="Extract audio from video as MP3")
+    
+    # Configuration options
+    p.add_argument("-a", dest="audio", metavar="AUDIO_FILE",
+                   help="Audio file for AMV operation")
     p.add_argument("-c", default=DEFAULT_CODEC, metavar="CODEC",
                    help=f"Video codec (h264, hevc, av1) [default: {DEFAULT_CODEC}]")
-    p.add_argument("-g", action="store_true", 
-                   help="Enable GPU acceleration")
     p.add_argument("-f", default=DEFAULT_FORMAT, metavar="FORMAT",
                    help=f"Output format (mov, mp4, mkv, webm) [default: {DEFAULT_FORMAT}]")
-    p.add_argument("-l", action="store_true", 
-                   help="Enable logging to file")
-    p.add_argument("-t", action="store_true", 
-                   help="Move original files to trash after processing")
-    p.add_argument("-d", action="store_true", 
-                   help="Debug mode (extra logging)")
     p.add_argument("-s", dest="suffix", default=SUFFIX,
                    help=f"Custom suffix for output files [default: {SUFFIX}]")
+    
+    # Behavior flags
+    p.add_argument("-g", action="store_true", 
+                   help="Enable GPU acceleration")
+    p.add_argument("-t", action="store_true", 
+                   help="Move original files to trash after processing")
+    p.add_argument("-v", action="store_true", 
+                   help="Verbose output")
+    p.add_argument("-d", action="store_true", 
+                   help="Debug mode (extra logging)")
+    p.add_argument("-l", action="store_true", 
+                   help="Enable logging to file")
     p.add_argument("-n", action="store_true",
                    help="Dry-run mode (show what would happen without processing)")
+    p.add_argument("-r", action="store_true",
+                   help="Recursive mode (process directories)")
     
-    # Positional arguments
-    p.add_argument("operation", 
-                   choices=["refine", "amv", "loop_audio", "audiofy"],
-                   help="Operation to perform (currently only 'refine' is fully implemented)")
-    p.add_argument("source", 
-                   help="Source file or directory to process")
-    p.add_argument("param", nargs="?", 
-                   help="Optional parameter (depends on operation)")
+    # File arguments
+    p.add_argument("files", nargs="+",
+                   help="Files or directories to process")
     
     args = p.parse_args()
 
+    # Set global flags
     ENABLE_LOGGING = args.l or args.v or args.d
     DEBUG_MODE = args.d
     USE_GPU = args.g
@@ -332,36 +520,55 @@ def main():
 
     setup_logging()
 
-    source_path = Path(args.source)
+    # Determine which operations to perform
+    operations = []
+    if args.refine:
+        operations.append("refine")
+    if args.amv:
+        operations.append("amv")
+    if args.loop_audio:
+        operations.append("loop_audio")
+    if args.audiofy:
+        operations.append("audiofy")
     
-    # Check working directory
-    display_debug(f"Current working directory: {os.getcwd()}")
-    display_debug(f"Source path: {source_path}")
-    
-    # Convert to absolute path if not already
-    if not source_path.is_absolute():
-        source_path = Path(os.getcwd()) / source_path
-        display_debug(f"Converted to absolute path: {source_path}")
+    # Default to refine if no operations specified
+    if not operations:
+        operations.append("refine")
+        display_info("No operations specified, defaulting to --refine")
 
-    if args.operation == "refine":
-        if source_path.is_dir():
-            refine_recursively(source_path, codec, fmt)
-        else:
-            if not source_path.exists():
-                logger.error(f"Not found: {source_path}")
-                return 1
-            if is_video_file(source_path):
-                process_video(source_path, codec, fmt)
-            elif is_image_file(source_path):
-                process_image(source_path)
-            else:
-                logger.error(f"Unsupported type: {source_path}")
-                return 1
-    else:
-        logger.error(f"Operation '{args.operation}' not fully implemented yet")
-        return 1
+    # Process each file
+    total_files = len(args.files)
+    processed = 0
+    failed = 0
+    
+    for idx, file_path in enumerate(args.files, 1):
+        file_path = Path(file_path)
+        display_info(f"[{idx}/{total_files}] Processing: {file_path}")
         
-    return 0
+        # Handle directories
+        if file_path.is_dir():
+            if args.r:
+                refine_recursively(file_path, codec, fmt)
+            else:
+                display_error(f"Directory specified but -r flag not set: {file_path}")
+                failed += 1
+            continue
+        
+        # Process single file
+        if process_single_file(file_path, operations, args.audio, codec, fmt):
+            display_info(f"✓ {file_path}")
+            processed += 1
+        else:
+            display_error(f"✗ {file_path}")
+            failed += 1
+    
+    display_info(f"Processing complete. Success: {processed}, Failed: {failed}")
+    
+    # Show notification when complete
+    if not DRY_RUN and total_files > 1:
+        notify("Automat", f"Processed {processed} files, {failed} failed")
+        
+    return 0 if failed == 0 else 1
 
 if __name__ == "__main__":
     sys.exit(main())
