@@ -402,19 +402,96 @@ def process_single_file(file_path, operations, audio_track, codec, fmt):
     
     return success
 
+def expand_paths_recursively(paths):
+    """Recursively expand all given paths into a flat list of media files"""
+    expanded_files = []
+    
+    for path_str in paths:
+        path = Path(path_str)
+        
+        # Convert to absolute path
+        if not path.is_absolute():
+            path = Path(os.getcwd()) / path
+            
+        if path.is_file():
+            # Single file - add if it's a media file and not already processed
+            if not is_already_processed(path) and (is_video_file(path) or is_image_file(path)):
+                expanded_files.append(path)
+        elif path.is_dir():
+            # Directory - recursively find all media files
+            for file_path in path.rglob("*"):
+                if file_path.is_file() and not is_already_processed(file_path):
+                    if is_video_file(file_path) or is_image_file(file_path):
+                        expanded_files.append(file_path)
+        else:
+            display_error(f"Path not found: {path}")
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_files = []
+    for file_path in expanded_files:
+        if file_path not in seen:
+            seen.add(file_path)
+            unique_files.append(file_path)
+    
+    return unique_files
+
+def get_base_path(paths):
+    """Get the base path for progress/error files from the first path argument"""
+    if not paths:
+        return Path.cwd()
+    
+    first_path = Path(paths[0])
+    if not first_path.is_absolute():
+        first_path = Path.cwd() / first_path
+    
+    if first_path.is_file():
+        return first_path.parent
+    elif first_path.is_dir():
+        return first_path
+    else:
+        return Path.cwd()
+
+def update_progress_file(progress_file, total, processed, errors):
+    """Update the progress tracking file"""
+    if DRY_RUN:
+        display_info(f"[DRY RUN] Would update progress: {total}/{processed}/{errors}")
+        return
+    
+    try:
+        with open(progress_file, 'w') as f:
+            f.write(f"{total}/{processed}/{errors}\n")
+    except Exception as e:
+        display_error(f"Failed to update progress file: {e}")
+
+def log_error_file(error_file, file_path):
+    """Append failed file path to error log"""
+    if DRY_RUN:
+        display_info(f"[DRY RUN] Would log error: {file_path}")
+        return
+    
+    try:
+        with open(error_file, 'a') as f:
+            f.write(f"{file_path}\n")
+    except Exception as e:
+        display_error(f"Failed to write to error file: {e}")
+
 def refine_recursively(directory, codec, fmt):
     """Recursively process all files in directory (legacy function for compatibility)"""
     display_info(f"Recursively refining: {directory}")
-    files = []
-    directory = Path(directory)
-    for path in directory.rglob("*"):
-        if path.stem.endswith(SUFFIX):
-            continue
-        if is_video_file(path) or is_image_file(path):
-            files.append(path)
+    files = expand_paths_recursively([directory])
     
     total = len(files)
     display_info(f"Found {total} files")
+    
+    # Set up progress tracking
+    base_path = get_base_path([directory])
+    progress_file = base_path / "automat-progress.txt"
+    error_file = base_path / "automat-errors.txt"
+    
+    # Initialize progress file
+    update_progress_file(progress_file, total, 0, 0)
+    
     proc = fail = 0
     
     for idx, path in enumerate(files, 1):
@@ -425,6 +502,10 @@ def refine_recursively(directory, codec, fmt):
         else:
             display_error(f"✗ {path}")
             fail += 1
+            log_error_file(error_file, path)
+        
+        # Update progress after each file
+        update_progress_file(progress_file, total, proc, fail)
     
     display_info(f"Done. Processed: {proc}, Failed: {fail}")
     if not DRY_RUN:
@@ -499,8 +580,6 @@ def main():
                    help="Enable logging to file")
     p.add_argument("-n", action="store_true",
                    help="Dry-run mode (show what would happen without processing)")
-    p.add_argument("-r", action="store_true",
-                   help="Recursive mode (process directories)")
     
     # File arguments
     p.add_argument("files", nargs="+",
@@ -536,23 +615,41 @@ def main():
         operations.append("refine")
         display_info("No operations specified, defaulting to --refine")
 
-    # Process each file
-    total_files = len(args.files)
+    # First, recursively expand all paths into a flat list of media files
+    display_info("Expanding paths and discovering media files...")
+    all_files = expand_paths_recursively(args.files)
+    
+    if not all_files:
+        display_error("No media files found to process")
+        return 1
+    
+    total_files = len(all_files)
+    display_info(f"Found {total_files} media files to process")
+    
+    # Set up progress and error tracking
+    base_path = get_base_path(args.files)
+    progress_file = base_path / "automat-progress.txt"
+    error_file = base_path / "automat-errors.txt"
+    
+    display_info(f"Progress will be tracked in: {progress_file}")
+    display_info(f"Errors will be logged in: {error_file}")
+    
+    # Initialize progress file
+    update_progress_file(progress_file, total_files, 0, 0)
+    
+    # Remove existing error file to start fresh
+    if not DRY_RUN and error_file.exists():
+        try:
+            error_file.unlink()
+        except Exception as e:
+            display_error(f"Failed to remove existing error file: {e}")
+    
     processed = 0
     failed = 0
     
-    for idx, file_path in enumerate(args.files, 1):
-        file_path = Path(file_path)
+    # Process each file
+    for idx, file_path in enumerate(all_files, 1):
         display_info(f"[{idx}/{total_files}] Processing: {file_path}")
-        
-        # Handle directories
-        if file_path.is_dir():
-            if args.r:
-                refine_recursively(file_path, codec, fmt)
-            else:
-                display_error(f"Directory specified but -r flag not set: {file_path}")
-                failed += 1
-            continue
         
         # Process single file
         if process_single_file(file_path, operations, args.audio, codec, fmt):
@@ -561,8 +658,15 @@ def main():
         else:
             display_error(f"✗ {file_path}")
             failed += 1
+            log_error_file(error_file, file_path)
+        
+        # Update progress after each file
+        update_progress_file(progress_file, total_files, processed, failed)
     
     display_info(f"Processing complete. Success: {processed}, Failed: {failed}")
+    
+    # Final progress update
+    update_progress_file(progress_file, total_files, processed, failed)
     
     # Show notification when complete
     if not DRY_RUN and total_files > 1:
