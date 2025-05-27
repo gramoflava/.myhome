@@ -18,7 +18,7 @@ DEBUG_MODE = False
 DRY_RUN = False
 SUFFIX = "-re"
 DEFAULT_CODEC = "hevc"
-DEFAULT_FORMAT = "mp4"
+DEFAULT_FORMAT = "mov"
 
 # Default CPU-based CRF encoding settings
 DEFAULT_PRESET = "slow"  # encoding speed vs compression efficiency
