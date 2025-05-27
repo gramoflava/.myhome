@@ -445,10 +445,8 @@ def get_base_path(paths):
     if not first_path.is_absolute():
         first_path = Path.cwd() / first_path
     
-    if first_path.is_file():
+    if first_path.is_file() or first_path.is_dir():
         return first_path.parent
-    elif first_path.is_dir():
-        return first_path
     else:
         return Path.cwd()
 
