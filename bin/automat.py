@@ -17,7 +17,7 @@ TRASH_MODE = False
 DEBUG_MODE = False
 DRY_RUN = False
 SUFFIX = "-re"
-DEFAULT_CODEC = "hevc"
+DEFAULT_CODEC = "h264"
 DEFAULT_FORMAT = "mov"
 
 # Default CPU-based CRF encoding settings
@@ -365,11 +365,9 @@ def process_single_file(file_path, operations, audio_track, codec, fmt):
         return True
     
     success = True
-    
     # Process based on file type and operations
     if is_video_file(file_path):
         display_info(f"Processing video: {file_path}")
-        
         for operation in operations:
             if operation == "refine":
                 if not process_video_refine(file_path, codec, fmt):
@@ -386,21 +384,102 @@ def process_single_file(file_path, operations, audio_track, codec, fmt):
             elif operation == "audiofy":
                 if not process_video_audiofy(file_path, codec, fmt):
                     success = False
-    
+
     elif is_image_file(file_path):
         display_info(f"Processing image: {file_path}")
-        # For images, we only support the refine operation (convert to HEIC)
-        if "refine" in operations:
-            if not process_image(file_path):
-                success = False
-        else:
-            display_info(f"Skipping image (no supported operations): {file_path}")
-    
+        for operation in operations:
+            if operation == "refine":
+                if not process_image(file_path):
+                    success = False
+            elif operation == "audiofy" and audio_track:
+                if not process_image_audiofy(file_path, audio_track, codec, fmt):
+                    success = False
+            else:
+                if operation not in ("refine", "audiofy"):
+                    display_info(f"Skipping image (no supported operations): {file_path}")
     else:
         display_error(f"Unsupported file type: {file_path}")
         success = False
-    
     return success
+def process_image_audiofy(src, audio_track, codec, fmt):
+    """
+    Given an image and an audio track, create a video of the image with the audio.
+    If audio_track is a video, extract its audio stream first.
+    """
+    import uuid
+    src = Path(src)
+    audio_track = Path(audio_track)
+    tmp_audio = None
+    try:
+        # Determine if audio_track is a video file
+        if is_video_file(audio_track):
+            # extract audio to temp file
+            tmpdir = tempfile.gettempdir()
+            tmp_audio_name = f"automat_tmp_audio_{uuid.uuid4().hex}.mp3"
+            tmp_audio = Path(tmpdir) / tmp_audio_name
+            cmd_extract = [
+                "ffmpeg", "-i", str(audio_track), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(tmp_audio)
+            ]
+            logger.info("Extracting audio from video: " + " ".join(cmd_extract))
+            res = run_command(cmd_extract)
+            if res.returncode != 0 and not DRY_RUN:
+                display_error("Failed to extract audio from video for image+audio operation")
+                return False
+            audio_input = tmp_audio
+        else:
+            audio_input = audio_track
+
+        # Get duration of audio
+        cmd_probe = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(audio_input)
+        ]
+        res = run_command(cmd_probe)
+        if res.returncode != 0 or not res.stdout.strip():
+            display_error(f"Could not determine audio duration: {audio_input}")
+            return False
+        duration = float(res.stdout.strip())
+
+        # Output filename
+        out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
+
+        # Build ffmpeg command to create video from image + audio
+        # Use -loop 1 to repeat image, -framerate 30, -t for duration, -shortest for audio, -r 30 before output
+        cmd = [
+            "ffmpeg",
+            "-loop", "1",
+            "-framerate", "30",
+            "-i", str(src),
+            "-i", str(audio_input),
+            "-c:v", "libx264" if codec == "h264" else ("libx265" if codec == "hevc" else "libaom-av1"),
+            "-t", str(duration),
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+            "-movflags", "+faststart",
+            "-r", "30",
+            "-y",
+            str(out)
+        ]
+        logger.info("Running: " + " ".join(str(x) for x in cmd))
+        res = run_command(cmd)
+        if res.returncode != 0 and not DRY_RUN:
+            display_error("ffmpeg failed to create video from image and audio")
+            return False
+        if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+            display_error(f"Output missing: {out}")
+            return False
+        display_info(f"Created video from image and audio: {out}")
+        if TRASH_MODE:
+            move_to_trash(src)
+        return True
+    finally:
+        # Clean up temp audio file if it was created
+        if tmp_audio is not None and Path(tmp_audio).exists():
+            try:
+                Path(tmp_audio).unlink()
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp audio file: {tmp_audio} ({e})")
 
 def expand_paths_recursively(paths):
     """Recursively expand all given paths into a flat list of media files"""
@@ -553,13 +632,13 @@ def main():
     p.add_argument("--loop-audio", dest="loop_audio", action="store_true",
                    help="Loop audio to match video duration")
     p.add_argument("--audiofy", action="store_true",
-                   help="Extract audio from video as MP3")
+                   help="Extract audio from video as MP3, or if an image and an audio are given, create a video from the image with the audio track. For best macOS compatibility, use -c h264.")
     
     # Configuration options
     p.add_argument("-a", dest="audio", metavar="AUDIO_FILE",
                    help="Audio file for AMV operation")
     p.add_argument("-c", default=DEFAULT_CODEC, metavar="CODEC",
-                   help=f"Video codec (h264, hevc, av1) [default: {DEFAULT_CODEC}]")
+                   help=f"Video codec (h264, hevc, av1) [default: {DEFAULT_CODEC}] (now defaults to h264; h264 recommended for macOS compatibility)")
     p.add_argument("-f", default=DEFAULT_FORMAT, metavar="FORMAT",
                    help=f"Output format (mov, mp4, mkv, webm) [default: {DEFAULT_FORMAT}]")
     p.add_argument("-s", dest="suffix", default=SUFFIX,
