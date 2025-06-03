@@ -602,37 +602,47 @@ def expand_paths_recursively(paths):
     return unique_files
 
 def get_base_path(paths):
-    """Get the base path for progress/error files from the first path argument"""
+    """Get the base path for progress/error log files from the first path argument"""
     if not paths:
         return Path.cwd()
-    
     first_path = Path(paths[0])
     if not first_path.is_absolute():
         first_path = Path.cwd() / first_path
-    
-    if first_path.is_file() or first_path.is_dir():
+    if first_path.is_file():
         return first_path.parent
+    elif first_path.is_dir():
+        return first_path
     else:
         return Path.cwd()
 
-def update_progress_file(progress_file, total, processed, errors):
-    """Update the progress tracking file"""
+def update_progress_file(progress_file, total, processed, errors, progress_created):
+    """
+    Update the progress tracking file (.automat-progress.log) if it exists.
+    Only create or update after 3 minutes (see main for logic).
+    """
     if DRY_RUN:
         display_info(f"[DRY RUN] Would update progress: {total}/{processed}/{errors}")
         return
-    
+    if not progress_created:
+        # Do not create the file if it doesn't exist yet
+        return
     try:
         with open(progress_file, 'w') as f:
             f.write(f"{total}/{processed}/{errors}\n")
     except Exception as e:
         display_error(f"Failed to update progress file: {e}")
 
-def log_error_file(error_file, file_path):
-    """Append failed file path to error log"""
+def log_error_file(error_file, file_path, error_created):
+    """
+    Append failed file path to error log (.automat-errors.log) if it exists.
+    Only create or update after 3 minutes (see main for logic).
+    """
     if DRY_RUN:
         display_info(f"[DRY RUN] Would log error: {file_path}")
         return
-    
+    if not error_created:
+        # Do not create the file if it doesn't exist yet
+        return
     try:
         with open(error_file, 'a') as f:
             f.write(f"{file_path}\n")
@@ -675,13 +685,25 @@ def refine_recursively(directory, codec, fmt):
         notify("Automat", f"Processed {proc} files, {fail} failed")
 
 def main():
+    """
+    Main entry point for Automat.
+
+    Progress and error logs:
+      - Progress and error logs are only created and updated for long runs (over 3 minutes).
+      - Progress log: .automat-progress.log in the first input's directory.
+      - Error log: .automat-errors.log in the first input's directory.
+      - These files are NOT created at start. They are only created/updated if the run exceeds 3 minutes.
+      - At the end, if these files exist and there were no errors, they are deleted.
+    """
+    import time
     global ENABLE_LOGGING, TRASH_MODE, DEBUG_MODE, DRY_RUN, SUFFIX
     p = argparse.ArgumentParser(
         description=(
             "Automat: refine videos and images using hardware-accelerated encoding.\n\n"
             "This tool optimizes media files by re-encoding them with efficient codecs.\n"
             "Videos are processed with ffmpeg using hardware acceleration when available.\n"
-            "Images are converted to HEIC format using sips for better compression."
+            "Images are converted to HEIC format using sips for better compression.\n\n"
+            "Progress and error logs (.automat-progress.log, .automat-errors.log) are only created for long runs (over 3 minutes) and are always located in the first input's directory."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -802,24 +824,35 @@ def main():
 
     # Set up progress and error tracking
     base_path = get_base_path(args.files)
-    progress_file = base_path / "automat-progress.txt"
-    error_file = base_path / "automat-errors.txt"
+    progress_file = base_path / ".automat-progress.log"
+    error_file = base_path / ".automat-errors.log"
 
     display_info(f"Progress will be tracked in: {progress_file}")
     display_info(f"Errors will be logged in: {error_file}")
 
-    # Initialize progress file
-    update_progress_file(progress_file, total_files, 0, 0)
+    # Do not create progress or error files yet
+    progress_created = False
+    error_created = False
 
-    # Remove existing error file to start fresh
+    processed = 0
+    failed = 0
+
+    # Remove existing error file to start fresh (only if it exists)
     if not DRY_RUN and error_file.exists():
         try:
             error_file.unlink()
         except Exception as e:
             display_error(f"Failed to remove existing error file: {e}")
 
-    processed = 0
-    failed = 0
+    # Remove existing progress file if it exists (for clean start)
+    if not DRY_RUN and progress_file.exists():
+        try:
+            progress_file.unlink()
+        except Exception as e:
+            display_error(f"Failed to remove existing progress file: {e}")
+
+    import time
+    process_start = time.time()
 
     # Process each file
     for idx, file_path in enumerate(all_files, 1):
@@ -832,19 +865,42 @@ def main():
         else:
             display_error(f"✗ {file_path}")
             failed += 1
-            log_error_file(error_file, file_path)
 
-        # Update progress after each file
-        update_progress_file(progress_file, total_files, processed, failed)
+        elapsed = time.time() - process_start
+
+        # Only create and update progress/error files if elapsed > 180s (3 minutes)
+        if elapsed > 180:
+            if not progress_created:
+                progress_created = True
+            if not error_created:
+                error_created = True
+        # Update progress file if it exists
+        update_progress_file(progress_file, total_files, processed, failed, progress_created)
+        # Log error if needed and error file exists
+        if failed > 0:
+            log_error_file(error_file, file_path, error_created)
 
     display_info(f"Processing complete. Success: {processed}, Failed: {failed}")
 
-    # Final progress update
-    update_progress_file(progress_file, total_files, processed, failed)
+    # Final progress update if file exists
+    update_progress_file(progress_file, total_files, processed, failed, progress_created)
 
     # Show notification when complete
     if not DRY_RUN and total_files > 1:
         notify("Automat", f"Processed {processed} files, {failed} failed")
+
+    # If .automat-progress.log exists and there were no errors, delete it
+    if not DRY_RUN and progress_file.exists() and failed == 0:
+        try:
+            progress_file.unlink()
+        except Exception as e:
+            display_error(f"Failed to remove progress log: {e}")
+    # If .automat-errors.log exists and there were no errors, delete it
+    if not DRY_RUN and error_file.exists() and failed == 0:
+        try:
+            error_file.unlink()
+        except Exception as e:
+            display_error(f"Failed to remove error log: {e}")
 
     return 0 if failed == 0 else 1
 
