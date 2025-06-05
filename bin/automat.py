@@ -699,9 +699,10 @@ def main():
     global ENABLE_LOGGING, TRASH_MODE, DEBUG_MODE, DRY_RUN, SUFFIX
     p = argparse.ArgumentParser(
         description=(
-            "Automat: refine videos and images using hardware-accelerated encoding.\n\n"
+            "Automat: refine videos and images using CPU or hardware-accelerated (GPU) encoding.\n\n"
             "This tool optimizes media files by re-encoding them with efficient codecs.\n"
-            "Videos are processed with ffmpeg using hardware acceleration when available.\n"
+            "Videos are processed with ffmpeg using CPU encoding by default (better compression, slower).\n"
+            "Use --use-gpu to enable hardware-accelerated (videotoolbox) encoding for faster results (less compression).\n"
             "Images are converted to HEIC format using sips for better compression.\n\n"
             "Progress and error logs (.automat-progress.log, .automat-errors.log) are only created for long runs (over 3 minutes) and are always located in the first input's directory."
         ),
@@ -712,8 +713,8 @@ def main():
             "  automat.py -t --refine video1.mp4 video2.avi video3.mkv\n\n"
             "  # Create AMV with new audio track:\n"
             "  automat.py --amv -a new_track.mp3 -c h264 -f mp4 video.avi\n\n"
-            "  # Use CPU instead of GPU (better compression, slower):\n"
-            "  automat.py --force-cpu --refine myvideo.mp4\n\n"
+            "  # Use GPU instead of CPU (faster, less compression):\n"
+            "  automat.py --use-gpu --refine myvideo.mp4\n\n"
             "  # Multiple operations on multiple files:\n"
             "  automat.py -t --amv --refine -a track.mp3 file1.avi file2.mkv\n\n"
             ""
@@ -753,8 +754,8 @@ def main():
                    help=f"Custom suffix for output files [default: {SUFFIX}]")
 
     # Behavior flags
-    p.add_argument("--force-cpu", action="store_true",
-                   help="Force CPU-encoder (libx264/libx265) for better compression. Default: HW-accelerated (videotoolbox) for faster results.")
+    p.add_argument("--use-gpu", action="store_true",
+                   help="Use GPU (videotoolbox) for hardware-accelerated encoding (default: CPU encoding, slower but better compression).")
     p.add_argument("-t", action="store_true",
                    help="Move original files to trash after processing")
     p.add_argument("-v", action="store_true",
@@ -784,16 +785,16 @@ def main():
     setup_logging()
 
     # Determine if we should use CPU or GPU (videotoolbox)
-    if args.force_cpu:
-        is_cpu = True
-        display_info("Forced CPU-encoding (libx264/libx265).")
-    else:
+    if args.use_gpu:
         if is_videotoolbox_available():
             is_cpu = False
-            display_info("GPU-accelerated encoding (videotoolbox).")
+            display_info("GPU-accelerated encoding (videotoolbox) enabled (--use-gpu).")
         else:
             is_cpu = True
-            display_info("Cannot identify GPU-acceleration (videotoolbox), default to CPU.")
+            display_info("Requested GPU encoding but videotoolbox not available. Falling back to CPU.")
+    else:
+        is_cpu = True
+        display_info("CPU-encoding (libx264/libx265) is default. Use --use-gpu to enable hardware acceleration.")
 
     # Determine which operations to perform
     operations = []
