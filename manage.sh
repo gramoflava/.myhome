@@ -26,33 +26,37 @@ init() {
     echo "INFO: Zprofile"
     if [ ! -f "$HOME/.zprofile" ]; then
         echo "INFO: Creating new $HOME/.zprofile"
-        echo 'source "$HOME/.myhome/cfg/zprofile"' > "$HOME/.zprofile"
+        echo 'source "$BASEDIR/cfg/zprofile"' > "$HOME/.zprofile"
     elif [ ! -s "$HOME/.zprofile" ]; then
         echo "WARN: Removing linked $HOME/.zprofile"
         echo "INFO: Creating new $HOME/.zprofile"
         rm "$HOME/.zprofile"
-        echo 'source "$HOME/.myhome/cfg/zprofile"' > "$HOME/.zprofile"
+        echo 'source "$BASEDIR/cfg/zprofile"' > "$HOME/.zprofile"
     else
         echo "INFO: Adding source line to $HOME/.zprofile"
-        grep -qxF 'source "$HOME/.myhome/cfg/zprofile"' "$HOME/.zprofile" 2>/dev/null \
+        grep -qxF 'source "$BASEDIR/cfg/zprofile"' "$HOME/.zprofile" 2>/dev/null \
             && echo "INFO: Zprofile already sourced" \
-            || sed -i '' '1s;^;source "$HOME/.myhome/cfg/zprofile"\n;' "$HOME/.zprofile"
+            || sed -i '' '1s;^;source "$BASEDIR/cfg/zprofile"\n;' "$HOME/.zprofile"
     fi
 
     echo "INFO: Zshrc"
     if [ ! -f "$HOME/.zshrc" ]; then
         echo "INFO: Creating new $HOME/.zshrc"
-        echo 'source "$HOME/.myhome/cfg/zshrc"' > "$HOME/.zshrc"
+        echo 'source "$BASEDIR/cfg/zshrc"' > "$HOME/.zshrc"
     elif [ ! -s "$HOME/.zshrc" ]; then
         echo "WARN: Removing linked $HOME/.zshrc"
         echo "INFO: Creating new $HOME/.zshrc"
         rm "$HOME/.zshrc"
-        echo 'source "$HOME/.myhome/cfg/zshrc"' > "$HOME/.zshrc"
+        echo 'source "$BASEDIR/cfg/zshrc"' > "$HOME/.zshrc"
     else
-        grep -qxF 'source "$HOME/.myhome/cfg/zshrc"' "$HOME/.zshrc" 2>/dev/null \
+        grep -qxF 'source "$BASEDIR/cfg/zshrc"' "$HOME/.zshrc" 2>/dev/null \
             && echo "INFO: Zshrc already sourced" \
-            || sed -i '' '1s;^;source "$HOME/.myhome/cfg/zshrc"\n;' "$HOME/.zshrc"
+            || sed -i '' '1s;^;source "$BASEDIR/cfg/zshrc"\n;' "$HOME/.zshrc"
     fi
+
+    echo "INFO: Vimrc"
+    ln -sf "$BASEDIR/cfg/vim/vimrc" "$HOME/.vimrc" 2>/dev/null || \
+        echo "WARN: Failed to link $HOME/.vimrc, it may already exist."
 
     # Core utilities
     echo "INFO: Core utilities"

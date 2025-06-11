@@ -1,0 +1,116 @@
+"" Use Vim settings, rather then Vi settings (much better!).
+"" This must be first, because it changes other options as a side effect.
+set nocompatible
+filetype off
+
+"" Do not clear screen on exit
+set t_ti= t_te=
+
+"" Allow backspacing over everything in insert mode
+set backspace=indent,eol,start
+
+set tabstop=4
+set shiftwidth=4
+set expandtab
+
+set nobackup
+
+"" Line numbering
+"set nu
+
+set virtualedit=all
+set history=500 " keep 50 lines of command line history
+set ruler       " show the cursor position all the time
+set showcmd     " display incomplete commands
+set noincsearch " do not do incremental searching
+set scrolloff=8
+
+"" In many terminal emulators the mouse works just fine, thus enable it.
+"if has('mouse')
+"    set mouse=a
+"endif
+
+"set regexpengine=1
+
+" Switch syntax highlighting on, when the terminal has colors
+" Also switch on highlighting the last used search pattern.
+if &t_Co > 255 || has("gui_running")
+    "" Color scheme
+    "" calmar256-dark calmar256-light summerfruit256 wombat256 xoria256 solarized desert256 desertEx
+    colorscheme desert
+    syntax on
+    set hlsearch
+else
+    set background=dark
+    if &t_Co > 7
+        syntax on
+        set hlsearch
+    endif
+endif
+
+"" Only do this part when compiled with support for autocommands.
+if has("autocmd")
+    "" Enable file type detection.
+    "" Use the default filetype settings, so that mail gets 'tw' set to 72,
+    "" 'cindent' is on in C files, etc.
+    "" Also load indent files, to automatically do language-dependent indenting.
+    filetype plugin indent on
+
+    "" Put these in an autocmd group, so that we can delete them easily.
+    augroup vimrcEx
+        au!
+
+        "" For all text files set 'textwidth' to 78 characters.
+        autocmd FileType text setlocal textwidth=78
+
+        "" When editing a file, always jump to the last known cursor position.
+        autocmd BufReadPost *
+                    \ if line("'\"") > 1 && line("'\"") <= line("$") |
+                    \   exe "normal! g`\"" |
+                    \ endif
+
+        autocmd FileType html setlocal shiftwidth=2 tabstop=2
+        autocmd FileType ruby setlocal shiftwidth=2 tabstop=2
+        autocmd FileType python setlocal expandtab shiftwidth=2 softtabstop=2
+    augroup END
+else
+    set autoindent  " always set autoindenting on
+endif
+
+"disable auto-comments insertion
+au FileType * setl fo-=cro
+
+set laststatus=2
+
+set statusline=
+"et statusline +=%{GitBranch()}                 "git branch
+set statusline +=%r                             "readonly
+set statusline +=%*%m%*                         "modified flag
+set statusline +=%*%<%t%*                       "filename
+set statusline +=%*%=%{&ff}%*                   "file format
+set statusline +=:
+set statusline +=%{strlen(&fenc)?&fenc:'none'}  "encoding
+set statusline +=\ %v                           "virtual column number
+set statusline +=x%l/%L                         "current line/total lines
+set statusline +=\ 0x%04B                       "character under cursor
+
+autocmd BufWritePre * :%s/\s\+$//e
+
+"buftabs
+noremap <f1> :bprev<CR>
+noremap <f2> :bnext<CR>
+
+"maps
+cmap w!! w !sudo tee >/dev/null %
+
+"Auto-resize
+autocmd VimResized * wincmd =
+
+"Automated re-read of .vimrc on update
+autocmd! bufwritepost ~/.vimrc execute "normal! :source ~/.vimrc"
+
+"ruby
+autocmd FileType ruby,eruby set omnifunc=rubycomplete#Complete
+autocmd FileType ruby,eruby let g:rubycomplete_buffer_loading = 1
+autocmd FileType ruby,eruby let g:rubycomplete_rails = 1
+autocmd FileType ruby,eruby let g:rubycomplete_classes_in_global = 1
