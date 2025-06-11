@@ -55,7 +55,7 @@ init() {
     fi
 
     echo "INFO: Vimrc"
-    ln -sf "$BASEDIR/cfg/vim/vimrc" "$HOME/.vimrc" 2>/dev/null || \
+    ln -sf "$BASEDIR/cfg/vimrc" "$HOME/.vimrc" 2>/dev/null || \
         echo "WARN: Failed to link $HOME/.vimrc, it may already exist."
 
     # Core utilities
