@@ -5,6 +5,9 @@
 setopt EXTENDED_GLOB     # Enable ^negation, etc., in glob patterns
 setopt NO_UNSET          # Error if you reference an undefined variable
 
+# suppress compinit warning
+typeset -g skip_global_compinit=1
+
 # Suppress spurious warnings when NO_UNSET is set
 export INSIDE_EMACS="${INSIDE_EMACS:-}"
 
