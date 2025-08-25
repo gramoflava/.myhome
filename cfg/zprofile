@@ -8,12 +8,9 @@ setopt NO_UNSET          # Error if you reference an undefined variable
 # Suppress spurious warnings when NO_UNSET is set
 export INSIDE_EMACS="${INSIDE_EMACS:-}"
 
-# Activate Homebrew if it exists
-if [ -x /opt/homebrew/bin/brew ]; then
-    eval "$(/opt/homebrew/bin/brew shellenv)"
-    export HOMEBREW_NO_ENV_HINTS=1
-elif [ -x /usr/local/bin/brew ]; then
-    eval "$(/usr/local/bin/brew shellenv)"
+# Activate Homebrew if it exists (macOS or Linux)
+if command -v brew >/dev/null 2>&1; then
+    eval "$(brew shellenv)"
     export HOMEBREW_NO_ENV_HINTS=1
 fi
 
@@ -21,6 +18,8 @@ fi
 typeset -a extra_paths
 extra_paths=(
     "$HOME/.myhome/bin"
+    "$HOME/.local/bin"
+    "$HOME/.cargo/bin"
 )
 export PATH="$(printf "%s:" "${extra_paths[@]}")$PATH"
 
