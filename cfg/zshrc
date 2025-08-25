@@ -3,7 +3,13 @@
 
 # Global settings and Prompt
 autoload -U colors && colors
-PROMPT="%(?.%{$fg[green]%}%#%{$reset_color%}.%{$fg[red]%}×%{$reset_color%}) "
+# Dynamic prompt: green % on success, red × on failure.
+# If over SSH, also show hostname before the symbol.
+if (( $+SSH_CONNECTION + $+SSH_CLIENT + $+SSH_TTY + $+REMOTEHOST )); then
+  PROMPT="%{$fg[yellow]%}%m%{$reset_color%} %(?.%{$fg[green]%}%#%{$reset_color%}.%{$fg[red]%}×%{$reset_color%}) "
+else
+  PROMPT="%(?.%{$fg[green]%}%#%{$reset_color%}.%{$fg[red]%}×%{$reset_color%}) "
+fi
 
 # Defaults for interactive
 setopt NO_BEEP           # Disable the bell
