@@ -105,4 +105,5 @@ zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file locatio
 # -U: Suppress alias expansion during function loading
 # -z: Use zsh style autoloading
 # -C: Skip security checks for faster loading
+skip_global_compinit=1
 autoload -Uz compinit && compinit -C
