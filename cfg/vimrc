@@ -1,10 +1,6 @@
-"" Use Vim settings, rather then Vi settings (much better!).
+"" Use Vim settings, rather than Vi settings (much better!).
 "" This must be first, because it changes other options as a side effect.
 set nocompatible
-filetype off
-
-"" Do not clear screen on exit
-set t_ti= t_te=
 
 "" Allow backspacing over everything in insert mode
 set backspace=indent,eol,start
@@ -32,21 +28,17 @@ set scrolloff=8
 
 "set regexpengine=1
 
-" Switch syntax highlighting on, when the terminal has colors
-" Also switch on highlighting the last used search pattern.
-if &t_Co > 255 || has("gui_running")
-    "" Color scheme
-    "" calmar256-dark calmar256-light summerfruit256 wombat256 xoria256 solarized desert256 desertEx
-    colorscheme desert
-    syntax on
-    set hlsearch
-else
-    set background=dark
-    if &t_Co > 7
-        syntax on
-        set hlsearch
-    endif
+" Simplified, terminal-agnostic colors
+syntax on
+set hlsearch
+if has('termguicolors')
+    set termguicolors
 endif
+try
+    colorscheme desert
+catch
+    " fallback to default if the colorscheme is unavailable
+endtry
 
 "" Only do this part when compiled with support for autocommands.
 if has("autocmd")
@@ -71,7 +63,7 @@ if has("autocmd")
 
         autocmd FileType html setlocal shiftwidth=2 tabstop=2
         autocmd FileType ruby setlocal shiftwidth=2 tabstop=2
-        autocmd FileType python setlocal expandtab shiftwidth=2 softtabstop=2
+        autocmd FileType python setlocal shiftwidth=2 softtabstop=2
     augroup END
 else
     set autoindent  " always set autoindenting on
@@ -106,8 +98,9 @@ cmap w!! w !sudo tee >/dev/null %
 "Auto-resize
 autocmd VimResized * wincmd =
 
-"Automated re-read of .vimrc on update
-autocmd! bufwritepost ~/.vimrc execute "normal! :source ~/.vimrc"
+" Auto-reload vimrc on save (both main and this cfg)
+autocmd! BufWritePost ~/.vimrc source $MYVIMRC
+autocmd BufWritePost ~/.myhome/cfg/vimrc source <afile>
 
 "ruby
 autocmd FileType ruby,eruby set omnifunc=rubycomplete#Complete
