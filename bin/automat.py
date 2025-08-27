@@ -602,17 +602,27 @@ def expand_paths_recursively(paths):
     return unique_files
 
 def get_base_path(paths):
-    """Get the base path for progress/error log files from the first path argument"""
+    """Get the base path for progress/error log files from the first path argument.
+    If the first argument is a directory, use its parent directory.
+    If it's a file, use its parent directory as well.
+    Otherwise, default to the current working directory.
+    """
     if not paths:
         return Path.cwd()
+
     first_path = Path(paths[0])
     if not first_path.is_absolute():
         first_path = Path.cwd() / first_path
-    if first_path.is_file():
-        return first_path.parent
-    elif first_path.is_dir():
-        return first_path
-    else:
+
+    try:
+        if first_path.is_file():
+            return first_path.parent
+        elif first_path.is_dir():
+            return first_path.parent
+        else:
+            return Path.cwd()
+    except Exception:
+        # In case of any filesystem access issues, fall back to CWD
         return Path.cwd()
 
 def update_progress_file(progress_file, total, processed, errors, progress_created):
