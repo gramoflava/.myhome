@@ -18,6 +18,20 @@ SUFFIX = "-re"
 DEFAULT_CODEC = "h264"
 DEFAULT_FORMAT = "mov"
 
+# ANSI colors for stderr tags
+COLOR_RESET = "\x1b[0m"
+COLOR_RED = "\x1b[31m"
+COLOR_YELLOW = "\x1b[33m"
+
+def color_tag(tag: str, color: str) -> str:
+    """Color only when stderr is a TTY."""
+    try:
+        if sys.stderr.isatty():
+            return f"{color}{tag}{COLOR_RESET}"
+    except Exception:
+        pass
+    return tag
+
 #
 # --- Video encoding quality/bitrate logic ---
 # CPU (libx264/libx265) CRF settings:
@@ -35,13 +49,12 @@ DEFAULT_PRESET = "slow"  # encoding speed vs compression efficiency
 DEFAULT_CRF_H264 = 24
 DEFAULT_CRF_HEVC = 29
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s] %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger(__name__)
 
 def setup_logging(log_path=None):
+    logger.handlers = []            # убрать любые существующие хендлеры
+    logger.propagate = False        # не пускать сообщения к root-логгеру
     logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
-    # Always enable logging to the provided log_path (RAW_LOG_FILE)
     if log_path is not None:
         file_handler = logging.FileHandler(log_path)
         file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
@@ -684,12 +697,11 @@ def refine_recursively(directory, codec, fmt):
     proc = fail = skipped = 0
     update_progress_file(progress_file, total, proc, skipped, fail)
 
-    for idx, path in enumerate(files, 1):
-        # Print file path to stdout as soon as encountered
-        print(str(path), flush=True)
-        # Count and report already processed as skipped
+    for path in files:
+        n = proc + skipped + fail + 1
+        print(f"{n}/{total}: {path}", flush=True)
         if is_already_processed(path):
-            print(f"[Skipped] {path}", file=sys.stderr, flush=True)
+            print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
             skipped += 1
             update_progress_file(progress_file, total, proc, skipped, fail)
             continue
@@ -698,7 +710,7 @@ def refine_recursively(directory, codec, fmt):
         if process_single_file(path, ["refine"], None, codec, fmt):
             proc += 1
         else:
-            print(f"[Failed] {path}", file=sys.stderr, flush=True)
+            print(print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True), file=sys.stderr, flush=True)
             fail += 1
             log_error_file(error_file, path)
         update_progress_file(progress_file, total, proc, skipped, fail)
@@ -881,21 +893,19 @@ def main():
     process_start = time.time()
 
     # Process each file
-    for idx, file_path in enumerate(all_files, 1):
-        # Print file path to stdout as soon as encountered
-        print(str(file_path), flush=True)
-        # Check if already processed
+    for file_path in all_files:
+        n = processed + skipped + failed + 1
+        print(f"{n}/{total_files}: {file_path}", flush=True)
         if is_already_processed(file_path):
-            print(f"[Skipped] {file_path}", file=sys.stderr, flush=True)
+            print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
             skipped += 1
             update_progress_file(progress_file, total_files, processed, skipped, failed)
             continue
-        # Process single file
         ok = process_single_file(file_path, operations, args.audio, codec, fmt, is_cpu=is_cpu)
         if ok:
             processed += 1
         else:
-            print(f"[Failed] {file_path}", file=sys.stderr, flush=True)
+            print(print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True), file=sys.stderr, flush=True)
             failed += 1
             log_error_file(error_file, file_path)
         update_progress_file(progress_file, total_files, processed, skipped, failed)
