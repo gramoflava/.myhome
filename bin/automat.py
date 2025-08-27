@@ -295,7 +295,7 @@ def process_video_refine(src, codec, fmt, is_cpu=None):
         move_to_trash(src)
     return True
 
-def process_video_amv(src, audio_track, codec, fmt):
+def process_video_amv(src, audio_track, codec, fmt, is_cpu=None):
     """Add or replace audio track in video (AMV operation)"""
     src = Path(src)
     audio_track = Path(audio_track)
@@ -307,7 +307,7 @@ def process_video_amv(src, audio_track, codec, fmt):
     
     # Build FFmpeg command for AMV operation
     cmd = ["ffmpeg"]
-    if USE_GPU:
+    if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
     
     cmd += [
@@ -338,7 +338,7 @@ def process_video_amv(src, audio_track, codec, fmt):
         move_to_trash(src)
     return True
 
-def process_video_loop_audio(src, codec, fmt):
+def process_video_loop_audio(src, codec, fmt, is_cpu=None):
     """Loop audio to match video duration"""
     src = Path(src)
     out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
@@ -363,7 +363,7 @@ def process_video_loop_audio(src, codec, fmt):
     
     # Build FFmpeg command to loop audio
     cmd = ["ffmpeg"]
-    if USE_GPU:
+    if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
     
     cmd += [
@@ -462,10 +462,10 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
                 if not audio_track:
                     display_error("AMV operation requires audio track (-a parameter)")
                     success = False
-                elif not process_video_amv(file_path, audio_track, codec, fmt):
+                elif not process_video_amv(file_path, audio_track, codec, fmt, is_cpu=is_cpu):
                     success = False
             elif operation == "loop_audio":
-                if not process_video_loop_audio(file_path, codec, fmt):
+                if not process_video_loop_audio(file_path, codec, fmt, is_cpu=is_cpu):
                     success = False
             elif operation == "audiofy":
                 if not process_video_audiofy(file_path, codec, fmt):
