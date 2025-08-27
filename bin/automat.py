@@ -579,13 +579,13 @@ def expand_paths_recursively(paths):
             path = Path(os.getcwd()) / path
             
         if path.is_file():
-            # Single file - add if it's a media file and not already processed
-            if not is_already_processed(path) and (is_video_file(path) or is_image_file(path)):
+            # Single file - add if it's a media file (include already-processed too)
+            if is_video_file(path) or is_image_file(path):
                 expanded_files.append(path)
         elif path.is_dir():
-            # Directory - recursively find all media files
+            # Directory - recursively find all media files (include already-processed too)
             for file_path in path.rglob("*"):
-                if file_path.is_file() and not is_already_processed(file_path):
+                if file_path.is_file():
                     if is_video_file(file_path) or is_image_file(file_path):
                         expanded_files.append(file_path)
         else:
