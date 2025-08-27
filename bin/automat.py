@@ -638,25 +638,25 @@ def get_base_path(paths):
         # In case of any filesystem access issues, fall back to CWD
         return Path.cwd()
 
-def update_progress_file(progress_file, total, done, skipped, errors):
+def update_progress_file(progress_file, total, done, skipped, failed):
     """
     Update the progress tracking file (.automat-progress.log) with new structure.
     """
     if DRY_RUN:
-        display_info(f"[DRY RUN] Would update progress: {total}/{done}/{skipped}/{errors}")
+        display_info(f"[DRY RUN] Would update progress: {total}/{done}/{skipped}/{failed}")
         return
     try:
         with open(progress_file, 'w') as f:
             f.write(f"Total: {total}\n")
             f.write(f"Done: {done}\n")
             f.write(f"Skipped: {skipped}\n")
-            f.write(f"Errors: {errors}\n")
+            f.write(f"Failed: {failed}\n")
     except Exception as e:
         display_error(f"Failed to update progress file: {e}")
 
 def log_error_file(error_file, file_path):
     """
-    Append failed file path to error log (.automat-errors.log).
+    Append failed file path to error log (.automat-failed.log).
     """
     if DRY_RUN:
         display_info(f"[DRY RUN] Would log error: {file_path}")
@@ -677,7 +677,7 @@ def refine_recursively(directory, codec, fmt):
     # Set up progress tracking
     base_path = get_base_path([directory])
     progress_file = base_path / ".automat-progress.log"
-    error_file = base_path / ".automat-errors.log"
+    error_file = base_path / ".automat-failed.log"
 
     # Initialize logs: start fresh
     if not DRY_RUN:
@@ -732,7 +732,7 @@ def main():
     Progress and error logs:
       - Progress and error logs are only created and updated for long runs (over 3 minutes).
       - Progress log: .automat-progress.log in the first input's directory.
-      - Error log: .automat-errors.log in the first input's directory.
+      - Error log: .automat-failed.log in the first input's directory.
       - These files are NOT created at start. They are only created/updated if the run exceeds 3 minutes.
       - At the end, if these files exist and there were no errors, they are deleted.
     """
@@ -745,7 +745,7 @@ def main():
             "Videos are processed with ffmpeg using CPU encoding by default (better compression, slower).\n"
             "Use --use-gpu to enable hardware-accelerated (videotoolbox) encoding for faster results (less compression).\n"
             "Images are converted to HEIC format using sips for better compression.\n\n"
-            "Progress and error logs (.automat-progress.log, .automat-errors.log) are only created for long runs (over 3 minutes) and are always located in the first input's directory."
+            "Progress and error logs (.automat-progress.log, .automat-failed.log) are only created for long runs (over 3 minutes) and are always located in the first input's directory."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -864,7 +864,7 @@ def main():
     # Set up progress, error, and raw log tracking
     base_path = get_base_path(args.files)
     progress_file = base_path / ".automat-progress.log"
-    error_file = base_path / ".automat-errors.log"
+    error_file = base_path / ".automat-failed.log"
     raw_log_file = base_path / ".automat-raw.log"
 
     # Remove existing log files to start fresh (only if they exist)
