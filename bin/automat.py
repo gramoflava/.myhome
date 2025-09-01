@@ -701,16 +701,16 @@ def refine_recursively(directory, codec, fmt):
         n = proc + skipped + fail + 1
         print(f"{n}/{total}: {path}", flush=True)
         if is_already_processed(path):
-            print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
+            print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {path}", file=sys.stderr, flush=True)
             skipped += 1
             update_progress_file(progress_file, total, proc, skipped, fail)
             continue
 
-        display_info(f"[{idx}/{total}] Processing: {path}")
+        display_info(f"[{n}/{total}] Processing: {path}")
         if process_single_file(path, ["refine"], None, codec, fmt):
             proc += 1
         else:
-            print(print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True), file=sys.stderr, flush=True)
+            print(f"{color_tag('[Failed]', COLOR_RED)} {path}", file=sys.stderr, flush=True)
             fail += 1
             log_error_file(error_file, path)
         update_progress_file(progress_file, total, proc, skipped, fail)
@@ -905,7 +905,7 @@ def main():
         if ok:
             processed += 1
         else:
-            print(print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True), file=sys.stderr, flush=True)
+            print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True)
             failed += 1
             log_error_file(error_file, file_path)
         update_progress_file(progress_file, total_files, processed, skipped, failed)
