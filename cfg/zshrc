@@ -67,10 +67,7 @@ elif grep --help 2>&1 | grep -q -- --color; then
 fi
 
 ## Completions
-setopt CORRECT                  # Enable command correction
-setopt CORRECT_ALL              # Argument correction
 setopt COMPLETE_IN_WORD         # Allow completion to act in the middle of a word
-CORRECT_IGNORE="[_|.]*"         # Don't correct files starting with _ or .
 
 ## ZSH Completion System
 # Completion paths: prefer Homebrew when present; also consider system path on Linux
