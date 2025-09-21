@@ -37,11 +37,23 @@ set hlsearch
 if has('termguicolors')
     set termguicolors
 endif
-try
-    colorscheme desert
-catch
-    " fallback to default if the colorscheme is unavailable
-endtry
+
+" Auto-detect background using $COLORFGBG when available, else reset to default
+if exists('$COLORFGBG')
+    let s:cfb = split($COLORFGBG, ';')
+    if len(s:cfb) > 0 && s:cfb[-1] =~# '^[0-7]$'
+        set background=dark
+    elseif len(s:cfb) > 0 && s:cfb[-1] =~# '^[8-9]|1[0-5]$'
+        set background=light
+    else
+        set background&
+    endif
+else
+    set background&
+endif
+
+colorscheme evening
+hi Normal ctermbg=NONE guibg=NONE   " ignore theme, keep background transparent
 
 "" Only do this part when compiled with support for autocommands.
 if has("autocmd")
