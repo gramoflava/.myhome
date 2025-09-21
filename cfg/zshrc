@@ -114,6 +114,3 @@ zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file locatio
 # -z: Use zsh style autoloading
 # -C: Skip security checks for faster loading
 autoload -Uz compinit && compinit -C
-
-# Vim default color theme
-export VIMINIT='let g:syntax_on=1 | set background=dark | colorscheme evening'
