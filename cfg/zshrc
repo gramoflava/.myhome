@@ -51,8 +51,13 @@ DIRSTACKSIZE=10                 # Directory stack size
 
 # OS-aware color aliases and common utils
 case "$OSTYPE" in
-  darwin*) alias ls='ls -G' ;;
-  linux*)  alias ls='ls --color=auto' ;;
+  darwin*)
+      alias ls='ls -G'
+      ;;
+  linux*)
+      alias ls='ls --color=auto'
+      alias svim=sudoedit
+      ;;
 esac
 
 # grep with colors when supported
@@ -109,3 +114,6 @@ zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file locatio
 # -z: Use zsh style autoloading
 # -C: Skip security checks for faster loading
 autoload -Uz compinit && compinit -C
+
+# Vim default color theme
+export VIMINIT='let g:syntax_on=1 | set background=dark | colorscheme evening'
