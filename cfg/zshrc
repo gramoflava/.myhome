@@ -94,13 +94,19 @@ for p in "$ZSH_COMPLETIONS_PATH" "$BREW_SITE_FUNCS" "$SYS_SITE_FUNCS"; do
 done
 
 # Completion behavior order:
-zstyle ':completion:*' completer _list _expand _complete _ignored _match _correct _approximate _prefix
+zstyle ':completion:*' completer _list _expand _match _complete _ignored _prefix
+# Smarter partial matching for path components and case-insensitive matches
+zstyle ':completion:*' matcher-list \
+  'm:{a-z}={A-Za-z}' \
+  'r:|[._-]=** r:|=**'
+zstyle ':completion:*' squeeze-slashes true
+zstyle ':completion:*' list-suffixes true
 zstyle ':completion:*' completions 10   # Limit completion suggestions
 zstyle ':completion:*' glob 1           # Advanced pattern matching in completions
 
 # Configure the prompt shown when scrolling through completion options
 zstyle ':completion:*' list-prompt %SAt %p: Hit TAB for more, or the character to insert%s
-zstyle ':completion:*' max-errors 2     # Errors allowed in approximate completion matching
+zstyle ':completion:*' max-errors 0     # Disable typo-correction prompts
 zstyle ':completion:*' menu yes select  # 'Select' allows using arrow keys to select completions
 bindkey -e                              # Use emacs key bindings
 bindkey '^I' menu-complete              # ^I (Tab): Cycle forward through completion menu
