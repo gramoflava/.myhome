@@ -12,6 +12,9 @@ else
 fi
 
 # Defaults for interactive
+# Allow inline comments in interactive commands and avoid glob errors on paste
+setopt INTERACTIVE_COMMENTS     # Treat text after '#' as a comment
+setopt NO_NOMATCH               # Do not error on unmatched globs; pass them literally
 setopt NO_BEEP           # Disable the bell
 setopt LIST_PACKED       # Pack long `ls`-style completion into columns
 setopt LIST_AMBIGUOUS    # Immediately show choices if completion is ambiguous
