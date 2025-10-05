@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""
+automat.py - Self-contained media processing tool for macOS
+
+A single-file script for optimizing videos and images with ffmpeg/sips.
+No external Python dependencies required (only stdlib).
+
+ARCHITECTURE:
+  - Configuration & Presets: Quality presets (meme/share/archive) + Config dataclass
+  - Media File Abstraction: MediaFile class with cached metadata + VideoInfo
+  - Codec Strategies: Pluggable codec strategies (H264/HEVC CPU/GPU, AV1)
+  - Operations: Base Operation class for refine/amv/audiofy/loop_audio
+  - Interactive Mode: Guided prompts for rare operations
+  - CLI Interface: Simplified argument parsing with preset support
+
+USAGE:
+  Most common: automat.py video.mp4                    # Quick refine with defaults
+  Memes:       automat.py --preset meme funny.mp4      # Smallest size
+  Batch:       automat.py -t ~/Downloads/videos/       # Process folder, trash originals
+  Interactive: automat.py -i video.mp4                 # Guided prompts
+  Auto:        automat.py --auto large_file.mov        # Auto-detect best preset
+
+PRESETS:
+  - meme:    Smallest size for sharing (CRF 28/32, 64k audio, max 1080p)
+  - share:   Balanced for messaging apps (CRF 24/28, 96k audio, max 1920p) [DEFAULT]
+  - archive: Best quality for storage (CRF 20/24, 192k audio, no limit)
+
+AUTHOR: lava
+LICENSE: Public domain
+"""
+
 import argparse
 import subprocess
 import sys
@@ -7,9 +37,47 @@ import tempfile
 import json
 import shutil
 import os
+import time
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+from abc import ABC, abstractmethod
 
-# Global settings
+# ============================================================================
+# CONFIGURATION & PRESETS
+# ============================================================================
+
+@dataclass
+class Preset:
+    """Quality preset definition"""
+    name: str
+    description: str
+    h264_crf: int
+    hevc_crf: int
+    max_resolution: Optional[int]
+    audio_bitrate: str
+
+PRESETS = {
+    "meme": Preset("meme", "Smallest size for sharing", 28, 32, 1080, "64k"),
+    "share": Preset("share", "Balanced for messaging apps", 24, 28, 1920, "96k"),
+    "archive": Preset("archive", "Best quality for storage", 20, 24, None, "192k"),
+}
+
+@dataclass
+class Config:
+    """Runtime configuration"""
+    preset: Preset
+    codec: str = "h264"
+    format: str = "mov"
+    use_gpu: bool = False
+    trash: bool = False
+    dry_run: bool = False
+    interactive: bool = False
+    suffix: str = "-re"
+    audio_file: Optional[Path] = None
+    debug: bool = False
+
+# Global settings (to be deprecated in favor of Config)
 RAW_LOG_FILE = ".automat-raw.log"
 TRASH_MODE = False
 DEBUG_MODE = False
@@ -32,22 +100,103 @@ def color_tag(tag: str, color: str) -> str:
         pass
     return tag
 
+# ============================================================================
+# MEDIA FILE ABSTRACTION
+# ============================================================================
+
+@dataclass
+class VideoInfo:
+    """Video metadata from ffprobe"""
+    width: int
+    height: int
+    duration: float
+    bitrate: int
+    filesize: int
+
+    @property
+    def is_hd(self) -> bool:
+        """Check if resolution is HD or higher (>1080p)"""
+        return max(self.width, self.height) > 1080
+
+    @property
+    def is_low_bitrate(self) -> bool:
+        """Check if video is already compressed (low bitrate)"""
+        threshold = 2_500_000 if self.is_hd else 1_200_000
+        return self.bitrate > 0 and self.bitrate < threshold
+
+class MediaFile:
+    """Represents a video or image file with cached metadata"""
+
+    def __init__(self, path: Path):
+        self.path = path if isinstance(path, Path) else Path(path)
+        self._mime_type: Optional[str] = None
+        self._video_info: Optional[VideoInfo] = None
+
+    @property
+    def mime_type(self) -> str:
+        """Cached MIME type detection"""
+        if self._mime_type is None:
+            if not self.path.is_file():
+                self._mime_type = ""
+            else:
+                res = run_command(["file", "--mime-type", "-b", str(self.path)])
+                self._mime_type = res.stdout.strip()
+        return self._mime_type
+
+    def is_video(self) -> bool:
+        """Check if file is a video"""
+        return self.mime_type.startswith("video/")
+
+    def is_image(self) -> bool:
+        """Check if file is an image"""
+        return self.mime_type.startswith("image/")
+
+    def is_already_processed(self, suffix: str) -> bool:
+        """Check if file was already processed by looking for the suffix"""
+        return self.path.stem.endswith(suffix)
+
+    def get_video_info(self) -> VideoInfo:
+        """Get cached video metadata from ffprobe"""
+        if self._video_info is None:
+            logger.debug("Getting info for: %s", self.path)
+            cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+                   "-show_format", "-show_streams", str(self.path)]
+            res = run_command(cmd)
+            if res.returncode != 0:
+                display_error(f"ffprobe error on {self.path}")
+                self._video_info = VideoInfo(0, 0, 0.0, 0, 0)
+            else:
+                info = json.loads(res.stdout)
+                stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
+                width = stream.get("width", 0) or 0
+                height = stream.get("height", 0) or 0
+                duration = float(info.get("format", {}).get("duration", 0.0)) or 0.0
+                filesize = self.path.stat().st_size
+                bitrate = int(info.get("format", {}).get("bit_rate", 0) or 0)
+                self._video_info = VideoInfo(width, height, duration, bitrate, filesize)
+                logger.info(f"Info: {width}x{height}, {duration}s, {bitrate}b/s, {filesize} bytes")
+        return self._video_info
+
+    def recommend_preset(self) -> str:
+        """Auto-recommend preset based on file size"""
+        size_mb = self.path.stat().st_size / 1_000_000
+        if size_mb < 10:
+            return "share"  # Already small
+        elif size_mb < 100:
+            return "meme"   # Make it smaller
+        else:
+            return "archive"  # Preserve quality for large files
+
+# ============================================================================
+# UTILITY FUNCTIONS (Logging, Display, Commands)
+# ============================================================================
 #
-# --- Video encoding quality/bitrate logic ---
-# CPU (libx264/libx265) CRF settings:
-#   - h264: default CRF 24
-#   - hevc: default CRF 29
-#   - If source is already compressed (bitrate < 1.2M for <=1080p, <2.5M for >1080p):
-#       - h264: CRF 26
-#       - hevc: CRF 31
-# GPU (videotoolbox) bitrate settings:
-#   - For SD/720p: min_gpu_bitrate = 450k
-#   - For HD and above: min_gpu_bitrate = 600k
-#   - If source bitrate < 1M: dynamic_bitrate = max(int(src_bitrate * 0.85), min_gpu_bitrate)
-#   - Otherwise, use previous logic
+# NOTE: The quality/CRF logic is now in CodecStrategy classes (see CODEC STRATEGIES section)
+#       Presets are defined above in PRESETS dict
+#
 DEFAULT_PRESET = "slow"  # encoding speed vs compression efficiency
-DEFAULT_CRF_H264 = 24
-DEFAULT_CRF_HEVC = 29
+DEFAULT_CRF_H264 = 24    # Legacy - now defined in Preset dataclass
+DEFAULT_CRF_HEVC = 29    # Legacy - now defined in Preset dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +216,7 @@ def notify(title, message):
 
 def display_error(message):
     logger.error(message)
-    
+
 def display_info(message):
     logger.info(message)
 
@@ -104,7 +253,7 @@ def move_to_trash(path):
     if DRY_RUN:
         display_info(f"[DRY RUN] Would move to trash: {path}")
         return
-        
+
     path = Path(path)
     if not path.exists():
         logger.error("File not found for trashing: %s", path)
@@ -157,6 +306,89 @@ def calculate_optimal_bitrate(w, h, curr, size, dur):
     chosen = round(chosen/100_000)*100_000
     logger.info(f"Optimal bitrate: {chosen}")
     return chosen
+
+# ============================================================================
+# CODEC STRATEGIES
+# ============================================================================
+
+class CodecStrategy(ABC):
+    """Base class for codec-specific encoding strategies"""
+
+    @abstractmethod
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        """Build codec-specific ffmpeg video options string"""
+        pass
+
+    def get_crf_for_quality(self, base_crf: int, video_info: VideoInfo) -> int:
+        """Adjust CRF based on source video bitrate (more aggressive for already-compressed)"""
+        if video_info.is_low_bitrate:
+            return base_crf + 4  # More aggressive compression
+        return base_crf
+
+    def get_dynamic_bitrate(self, video_info: VideoInfo) -> int:
+        """Calculate dynamic bitrate for GPU encoding"""
+        min_gpu_bitrate = 600_000 if video_info.is_hd else 450_000
+        gpu_bitrate_thresh = 4_000_000 if video_info.is_hd else 2_500_000
+
+        src_bitrate = video_info.bitrate if video_info.bitrate > 0 else gpu_bitrate_thresh
+
+        if src_bitrate < 1_000_000:
+            return max(int(src_bitrate * 0.85), min_gpu_bitrate)
+        else:
+            if src_bitrate > gpu_bitrate_thresh:
+                chosen = int(max(0.8 * src_bitrate, gpu_bitrate_thresh))
+                dynamic_bitrate = min(src_bitrate, chosen)
+            else:
+                dynamic_bitrate = src_bitrate
+            if dynamic_bitrate < min_gpu_bitrate:
+                dynamic_bitrate = min_gpu_bitrate
+            return dynamic_bitrate
+
+class H264CPUStrategy(CodecStrategy):
+    """H.264 CPU encoding with libx264"""
+
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        crf = self.get_crf_for_quality(config.preset.h264_crf, video_info)
+        return f"-c:v libx264 -preset slow -crf {crf}"
+
+class H264GPUStrategy(CodecStrategy):
+    """H.264 GPU encoding with videotoolbox"""
+
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        bitrate = self.get_dynamic_bitrate(video_info)
+        bval = f"{int(bitrate // 1000)}k"
+        return f"-c:v h264_videotoolbox -b:v {bval} -tag:v avc1"
+
+class HEVCCPUStrategy(CodecStrategy):
+    """HEVC/H.265 CPU encoding with libx265"""
+
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        crf = self.get_crf_for_quality(config.preset.hevc_crf, video_info)
+        return f'-c:v libx265 -preset slow -crf {crf} -tag:v hvc1 -x265-params "psy-rd=2.0:psy-rdoq=1.0:aq-mode=3:aq-strength=1.0:ref=5:bframes=8:rc-lookahead=60"'
+
+class HEVCGPUStrategy(CodecStrategy):
+    """HEVC/H.265 GPU encoding with videotoolbox"""
+
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        bitrate = self.get_dynamic_bitrate(video_info)
+        bval = f"{int(bitrate // 1000)}k"
+        return f"-c:v hevc_videotoolbox -b:v {bval} -tag:v hvc1"
+
+class AV1Strategy(CodecStrategy):
+    """AV1 encoding with libaom-av1 (experimental)"""
+
+    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
+        return "-c:v libaom-av1 -crf 30 -b:v 0 -strict experimental"
+
+# Codec strategy registry
+CODEC_REGISTRY = {
+    ("h264", True): H264CPUStrategy(),
+    ("h264", False): H264GPUStrategy(),
+    ("hevc", True): HEVCCPUStrategy(),
+    ("hevc", False): HEVCGPUStrategy(),
+    ("av1", True): AV1Strategy(),
+    ("av1", False): AV1Strategy(),  # AV1 doesn't have GPU variant yet
+}
 
 def is_videotoolbox_available():
     """Check if videotoolbox hardware encoder is available via ffmpeg."""
@@ -225,6 +457,62 @@ def build_ffmpeg_command(src, codec, fmt, is_cpu=None, crf_value=None, dynamic_b
     ]
     return cmd, out
 
+# ============================================================================
+# OPERATIONS BASE CLASS
+# ============================================================================
+
+@dataclass
+class Result:
+    """Result of a processing operation"""
+    success: bool
+    original_size: int = 0
+    new_size: int = 0
+    output_path: Optional[Path] = None
+
+    @property
+    def size_reduction_pct(self) -> float:
+        """Calculate size reduction percentage"""
+        if self.original_size > 0:
+            return (1 - self.new_size / self.original_size) * 100
+        return 0.0
+
+    @property
+    def original_size_mb(self) -> float:
+        """Original size in MB"""
+        return self.original_size / 1_000_000
+
+    @property
+    def new_size_mb(self) -> float:
+        """New size in MB"""
+        return self.new_size / 1_000_000
+
+class Operation(ABC):
+    """Base class for all media processing operations"""
+
+    @abstractmethod
+    def supports(self, media: MediaFile) -> bool:
+        """Check if this operation supports the given media file"""
+        pass
+
+    @abstractmethod
+    def execute(self, media: MediaFile, config: Config) -> Result:
+        """Execute the operation on the media file"""
+        pass
+
+    def _validate_ffmpeg_output(self, output: Path, dry_run: bool = False) -> bool:
+        """Common validation logic for FFmpeg outputs"""
+        if dry_run:
+            return True
+        if not output.is_file() or output.stat().st_size == 0:
+            display_error(f"Output missing or empty: {output}")
+            return False
+        return True
+
+    def _cleanup_source(self, media: MediaFile, config: Config):
+        """Common cleanup logic - move to trash if requested"""
+        if config.trash and not config.dry_run:
+            move_to_trash(media.path)
+
 def process_video_refine(src, codec, fmt, is_cpu=None):
     """
     Refine a video file by re-encoding it
@@ -267,7 +555,7 @@ def process_video_refine(src, codec, fmt, is_cpu=None):
                 crf_value = 24
         elif codec == "hevc":
             if br > 0 and br < low_bitrate_thresh:
-                crf_value = 32  
+                crf_value = 32
             else:
                 crf_value = 28
         # For av1, keep as before (CRF 30)
@@ -312,16 +600,16 @@ def process_video_amv(src, audio_track, codec, fmt, is_cpu=None):
     src = Path(src)
     audio_track = Path(audio_track)
     out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
-    
+
     if not audio_track.exists():
         display_error(f"Audio track not found: {audio_track}")
         return False
-    
+
     # Build FFmpeg command for AMV operation
     cmd = ["ffmpeg"]
     if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
-    
+
     cmd += [
         "-i", str(src),        # Video input
         "-i", str(audio_track), # Audio input
@@ -335,7 +623,7 @@ def process_video_amv(src, audio_track, codec, fmt, is_cpu=None):
         "-y",
         str(out)
     ]
-    
+
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
     if res.returncode != 0 and not DRY_RUN:
@@ -344,7 +632,7 @@ def process_video_amv(src, audio_track, codec, fmt, is_cpu=None):
     if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
         display_error(f"Output missing: {out}")
         return False
-    
+
     display_info(f"AMV created: {out}")
     if TRASH_MODE:
         move_to_trash(src)
@@ -354,7 +642,7 @@ def process_video_loop_audio(src, codec, fmt, is_cpu=None):
     """Loop audio to match video duration"""
     src = Path(src)
     out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
-    
+
     # Get video and audio duration info
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
            "-show_format", "-show_streams", str(src)]
@@ -362,22 +650,22 @@ def process_video_loop_audio(src, codec, fmt, is_cpu=None):
     if res.returncode != 0:
         display_error(f"ffprobe error on {src}")
         return False
-    
+
     info = json.loads(res.stdout)
     video_stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
     audio_stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="audio"), {})
-    
+
     if not video_stream or not audio_stream:
         display_error(f"Missing video or audio stream in {src}")
         return False
-    
+
     video_duration = float(video_stream.get("duration", 0) or info.get("format",{}).get("duration", 0))
-    
+
     # Build FFmpeg command to loop audio
     cmd = ["ffmpeg"]
     if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
-    
+
     cmd += [
         "-stream_loop", "-1",  # Loop audio indefinitely
         "-i", str(src),
@@ -389,7 +677,7 @@ def process_video_loop_audio(src, codec, fmt, is_cpu=None):
         "-y",
         str(out)
     ]
-    
+
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
     if res.returncode != 0 and not DRY_RUN:
@@ -398,7 +686,7 @@ def process_video_loop_audio(src, codec, fmt, is_cpu=None):
     if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
         display_error(f"Output missing: {out}")
         return False
-    
+
     display_info(f"Audio looped: {out}")
     if TRASH_MODE:
         move_to_trash(src)
@@ -408,9 +696,9 @@ def process_video_audiofy(src, codec, fmt):
     """Extract audio from video and save as audio file"""
     src = Path(src)
     out = src.parent / f"{src.stem}{SUFFIX}.mp3"
-    
+
     cmd = ["ffmpeg", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(out)]
-    
+
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
     if res.returncode != 0 and not DRY_RUN:
@@ -419,7 +707,7 @@ def process_video_audiofy(src, codec, fmt):
     if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
         display_error(f"Output missing: {out}")
         return False
-    
+
     display_info(f"Audio extracted: {out}")
     if TRASH_MODE:
         move_to_trash(src)
@@ -448,20 +736,20 @@ def process_image(src):
 def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=None):
     """Process a single file with the specified operations"""
     file_path = Path(file_path)
-    
+
     # Convert to absolute path if not already
     if not file_path.is_absolute():
         file_path = Path(os.getcwd()) / file_path
-    
+
     if not file_path.exists():
         display_error(f"File not found: {file_path}")
         return False
-    
+
     # Skip if already processed
     if is_already_processed(file_path):
         display_info(f"Skipping already processed file: {file_path}")
         return True
-    
+
     success = True
     # Process based on file type and operations
     if is_video_file(file_path):
@@ -582,14 +870,14 @@ def process_image_audiofy(src, audio_track, codec, fmt):
 def expand_paths_recursively(paths):
     """Recursively expand all given paths into a flat list of media files"""
     expanded_files = []
-    
+
     for path_str in paths:
         path = Path(path_str)
-        
+
         # Convert to absolute path
         if not path.is_absolute():
             path = Path(os.getcwd()) / path
-            
+
         if path.is_file():
             # Single file - add if it's a media file (include already-processed too)
             if is_video_file(path) or is_image_file(path):
@@ -602,7 +890,7 @@ def expand_paths_recursively(paths):
                         expanded_files.append(file_path)
         else:
             display_error(f"Path not found: {path}")
-    
+
     # Remove duplicates while preserving order
     seen = set()
     unique_files = []
@@ -610,7 +898,7 @@ def expand_paths_recursively(paths):
         if file_path not in seen:
             seen.add(file_path)
             unique_files.append(file_path)
-    
+
     return unique_files
 
 def get_base_path(paths):
@@ -724,6 +1012,104 @@ def refine_recursively(directory, codec, fmt):
                     try: f.unlink()
                     except Exception as e: display_error(f"Failed to remove log file {f}: {e}")
 
+# ============================================================================
+# INTERACTIVE MODE
+# ============================================================================
+
+class InteractiveMode:
+    """Guided prompts for rare operations"""
+
+    def run(self, files: List[Path], config: Config) -> Tuple[List[str], Config]:
+        """
+        Run interactive prompts and return selected operations and updated config.
+        Returns: (operations_list, updated_config)
+        """
+        print("\nAutomat Interactive Mode")
+        print("========================")
+        print(f"Files to process: {len(files)}")
+        print()
+        print("What would you like to do?")
+        print("1. Refine/compress (default)")
+        print("2. Add audio track (AMV)")
+        print("3. Loop audio to match video length")
+        print("4. Extract audio to MP3")
+        print("5. Create video from image + audio")
+        print()
+
+        choice = input("Choice [1]: ").strip() or "1"
+
+        operations = []
+
+        if choice == "1":
+            # Refine operation - ask about preset
+            print("\nQuality preset:")
+            print("  meme    - Smallest size for sharing")
+            print("  share   - Balanced for messaging apps (default)")
+            print("  archive - Best quality for storage")
+            preset_choice = input("Preset [share]: ").strip() or "share"
+            if preset_choice in PRESETS:
+                config.preset = PRESETS[preset_choice]
+            operations.append("refine")
+
+        elif choice == "2":
+            # AMV operation
+            audio = input("\nAudio file path: ").strip()
+            if not audio:
+                print("Error: Audio file required for AMV operation")
+                return (["refine"], config)  # Fall back to refine
+            config.audio_file = Path(audio)
+            if not config.audio_file.exists():
+                print(f"Error: Audio file not found: {audio}")
+                return (["refine"], config)
+            operations.append("amv")
+
+        elif choice == "3":
+            # Loop audio
+            operations.append("loop_audio")
+
+        elif choice == "4":
+            # Audiofy
+            operations.append("audiofy")
+
+        elif choice == "5":
+            # Image + audio to video
+            audio = input("\nAudio file path: ").strip()
+            if not audio:
+                print("Error: Audio file required")
+                return (["refine"], config)
+            config.audio_file = Path(audio)
+            if not config.audio_file.exists():
+                print(f"Error: Audio file not found: {audio}")
+                return (["refine"], config)
+            operations.append("audiofy")
+
+        else:
+            print(f"Invalid choice: {choice}, defaulting to refine")
+            operations.append("refine")
+
+        # Common questions
+        if operations:
+            print()
+            codec_choice = input(f"Output codec [h264]: ").strip() or "h264"
+            if codec_choice in ["h264", "hevc", "av1"]:
+                config.codec = codec_choice
+
+            trash_choice = input("Move originals to trash? [y/N]: ").strip().lower()
+            config.trash = trash_choice == "y"
+
+        print(f"\nReady to process {len(files)} file(s)")
+        print(f"Operations: {', '.join(operations)}")
+        print(f"Codec: {config.codec}")
+        print(f"Preset: {config.preset.name}")
+        print(f"Trash originals: {'Yes' if config.trash else 'No'}")
+        print()
+        confirm = input("Proceed? [Y/n]: ").strip().lower()
+        if confirm == "n":
+            print("Cancelled.")
+            sys.exit(0)
+
+        return (operations, config)
+
 def main():
     """
     Main entry point for Automat.
@@ -748,14 +1134,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # Refine multiple videos with HEVC codec and move to trash:\n"
-            "  automat.py -t --refine video1.mp4 video2.avi video3.mkv\n\n"
+            "  # Quick refine (most common use case):\n"
+            "  automat.py video.mp4\n\n"
+            "  # Smallest size for memes:\n"
+            "  automat.py --preset meme funny.mp4\n\n"
+            "  # Batch process folder and move originals to trash:\n"
+            "  automat.py -t ~/Downloads/videos/\n\n"
+            "  # Auto-detect best preset based on file size:\n"
+            "  automat.py --auto large_file.mov\n\n"
+            "  # Interactive mode for advanced operations:\n"
+            "  automat.py -i video.mp4\n\n"
             "  # Create AMV with new audio track:\n"
-            "  automat.py --amv -a new_track.mp3 -c h264 -f mp4 video.avi\n\n"
-            "  # Use GPU instead of CPU (faster, less compression):\n"
-            "  automat.py --use-gpu --refine myvideo.mp4\n\n"
-            "  # Multiple operations on multiple files:\n"
-            "  automat.py -t --amv --refine -a track.mp3 file1.avi file2.mkv\n\n"
+            "  automat.py --amv -a new_track.mp3 video.avi\n\n"
+            "  # Use GPU for faster encoding:\n"
+            "  automat.py --use-gpu video.mp4\n\n"
             ""
             "Automator Quick Action Example (macOS):\n"
             "  1. Open Automator and create a new \"Quick Action\".\n"
@@ -767,43 +1159,49 @@ def main():
             "     - Script:\n"
             "```\n"
             "source $HOME/.zprofile\n"
-            "automat.py -t --refine \"$@\"\n"
+            "automat.py -t \"$@\"\n"
             "```\n"
         )
     )
 
+    # Mode selection
+    p.add_argument("-i", "--interactive", action="store_true",
+                   help="Interactive mode with guided prompts for operations")
+
     # Operation flags
     p.add_argument("--refine", action="store_true",
-                   help="Refine/optimize video or image files")
+                   help="Refine/optimize video or image files (default operation)")
     p.add_argument("--amv", action="store_true",
                    help="Add or replace audio track in video (requires -a)")
     p.add_argument("--loop-audio", dest="loop_audio", action="store_true",
                    help="Loop audio to match video duration")
     p.add_argument("--audiofy", action="store_true",
-                   help="Extract audio from video as MP3, or if an image and an audio are given, create a video from the image with the audio track. For best macOS compatibility, use -c h264.")
+                   help="Extract audio from video as MP3, or create video from image+audio")
+
+    # Quality presets
+    p.add_argument("--preset", choices=["meme", "share", "archive"], default="share",
+                   help="Quality preset: meme (smallest), share (balanced, default), archive (best quality)")
+    p.add_argument("--auto", action="store_true",
+                   help="Auto-detect best preset based on file size")
 
     # Configuration options
-    p.add_argument("-a", dest="audio", metavar="AUDIO_FILE",
-                   help="Audio file for AMV operation")
-    p.add_argument("-c", default=DEFAULT_CODEC, metavar="CODEC",
-                   help="Video codec (h264, hevc, av1) [default: h264]. h264 — most compatible; hevc — better compression, slower, not as compatible. av1 - experimental, best compression but slowest and least compatible.")
-    p.add_argument("-f", default=DEFAULT_FORMAT, metavar="FORMAT",
+    p.add_argument("-a", "--audio", metavar="FILE",
+                   help="Audio file for AMV/audiofy operations")
+    p.add_argument("-c", "--codec", choices=["h264", "hevc", "av1"], default="h264",
+                   help="Video codec: h264 (most compatible, default), hevc (better compression), av1 (experimental)")
+    p.add_argument("-f", "--format", default=DEFAULT_FORMAT, metavar="FORMAT",
                    help=f"Output format (mov, mp4, mkv, webm) [default: {DEFAULT_FORMAT}]")
-    p.add_argument("-s", dest="suffix", default=SUFFIX,
+    p.add_argument("-s", "--suffix", default=SUFFIX,
                    help=f"Custom suffix for output files [default: {SUFFIX}]")
 
     # Behavior flags
     p.add_argument("--use-gpu", action="store_true",
-                   help="Use GPU (videotoolbox) for hardware-accelerated encoding (default: CPU encoding, slower but better compression).")
-    p.add_argument("-t", action="store_true",
+                   help="Use hardware acceleration (videotoolbox) for faster encoding")
+    p.add_argument("-t", "--trash", action="store_true",
                    help="Move original files to trash after processing")
-    p.add_argument("-v", action="store_true",
-                   help="Verbose output")
-    p.add_argument("-d", action="store_true",
+    p.add_argument("-d", "--debug", action="store_true",
                    help="Debug mode (extra logging)")
-    p.add_argument("-l", action="store_true",
-                   help="Enable logging to file")
-    p.add_argument("-n", action="store_true",
+    p.add_argument("-n", "--dry-run", action="store_true",
                    help="Dry-run mode (show what would happen without processing)")
 
     # File arguments
@@ -812,44 +1210,61 @@ def main():
 
     args = p.parse_args()
 
-    # Set global flags
-    DEBUG_MODE = args.d
-    TRASH_MODE = args.t
-    DRY_RUN = args.n
-    SUFFIX = args.suffix
-    codec = args.c
-    fmt = args.f
+    # Validate argument dependencies
+    if args.amv and not args.audio:
+        p.error("--amv requires -a/--audio AUDIO_FILE")
 
-    # Determine if we should use CPU or GPU (videotoolbox)
-    if args.use_gpu:
-        if is_videotoolbox_available():
-            is_cpu = False
-            display_info("GPU-accelerated encoding (videotoolbox) enabled (--use-gpu).")
-        else:
-            is_cpu = True
-            display_info("Requested GPU encoding but videotoolbox not available. Falling back to CPU.")
-    else:
-        is_cpu = True
-        display_info("CPU-encoding (libx264/libx265) is default. Use --use-gpu to enable hardware acceleration.")
+    # Set global flags (for backward compatibility with existing functions)
+    DEBUG_MODE = args.debug
+    TRASH_MODE = args.trash
+    DRY_RUN = args.dry_run
+    SUFFIX = args.suffix
+
+    # Build configuration object
+    preset = PRESETS[args.preset]
+    config = Config(
+        preset=preset,
+        codec=args.codec,
+        format=args.format,
+        use_gpu=args.use_gpu,
+        trash=args.trash,
+        dry_run=args.dry_run,
+        interactive=args.interactive,
+        suffix=args.suffix,
+        audio_file=Path(args.audio) if args.audio else None,
+        debug=args.debug,
+    )
+
+    # Check GPU availability
+    if config.use_gpu:
+        if not is_videotoolbox_available():
+            display_info("GPU encoding requested but videotoolbox not available. Falling back to CPU.")
+            config.use_gpu = False
 
     # Determine which operations to perform
     operations = []
-    if args.refine:
-        operations.append("refine")
-    if args.amv:
-        operations.append("amv")
-    if args.loop_audio:
-        operations.append("loop_audio")
-    if args.audiofy:
-        operations.append("audiofy")
 
-    # Default to refine if no operations specified
-    if not operations:
-        operations.append("refine")
-        display_info("No operations specified, defaulting to --refine")
+    if config.interactive:
+        # Interactive mode will determine operations
+        pass  # Handled below after file discovery
+    else:
+        # CLI mode - collect operations from flags
+        if args.refine:
+            operations.append("refine")
+        if args.amv:
+            operations.append("amv")
+        if args.loop_audio:
+            operations.append("loop_audio")
+        if args.audiofy:
+            operations.append("audiofy")
+
+        # Default to refine if no operations specified
+        if not operations:
+            operations.append("refine")
 
     # First, recursively expand all paths into a flat list of media files
-    display_info("Expanding paths and discovering media files...")
+    if not config.interactive:
+        display_info("Expanding paths and discovering media files...")
     all_files = expand_paths_recursively(args.files)
 
     if not all_files:
@@ -857,7 +1272,24 @@ def main():
         return 1
 
     total_files = len(all_files)
-    display_info(f"Found {total_files} media files to process")
+
+    # Handle interactive mode
+    if config.interactive:
+        interactive = InteractiveMode()
+        operations, config = interactive.run([Path(f) for f in all_files], config)
+        # Update global flags based on interactive config
+        TRASH_MODE = config.trash
+        DRY_RUN = config.dry_run
+        SUFFIX = config.suffix
+    elif args.auto and total_files == 1:
+        # Auto-detect preset for single file
+        media = MediaFile(Path(all_files[0]))
+        recommended = media.recommend_preset()
+        print(f"Auto-detected preset: {recommended} ({PRESETS[recommended].description})")
+        config.preset = PRESETS[recommended]
+
+    if not config.interactive:
+        display_info(f"Found {total_files} media files to process")
 
     # Set up progress, error, and raw log tracking
     base_path = get_base_path(args.files)
@@ -898,7 +1330,7 @@ def main():
             skipped += 1
             update_progress_file(progress_file, total_files, processed, skipped, failed)
             continue
-        ok = process_single_file(file_path, operations, args.audio, codec, fmt, is_cpu=is_cpu)
+        ok = process_single_file(file_path, operations, config.audio_file, config.codec, config.format, is_cpu=not config.use_gpu)
         if ok:
             processed += 1
         else:
