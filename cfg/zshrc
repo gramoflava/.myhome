@@ -32,9 +32,9 @@ setopt HIST_REDUCE_BLANKS       # Remove unnecessary blanks
 
 # History file configuration
 export HISTFILE=~/.histfile
-export HISTSIZE=1000            # History in memory
-export SAVEHIST=1000            # History on disk
-export HIST_IGNORE_PATTERN="(ls|cd|pwd|exit|cd ..)"  # Don't record common commands
+export HISTSIZE=5000            # History in memory
+export SAVEHIST=5000            # History on disk
+export HISTORY_IGNORE="(ls|cd|pwd|exit|cd ..)"  # Don't record common commands (extended glob pattern)
 
 # Editor/Pager
 export EDITOR='vim'
@@ -59,7 +59,6 @@ case "$OSTYPE" in
       ;;
   linux*)
       alias ls='ls --color=auto'
-      alias svim=sudoedit
       ;;
 esac
 
@@ -97,14 +96,15 @@ for p in "$ZSH_COMPLETIONS_PATH" "$BREW_SITE_FUNCS" "$SYS_SITE_FUNCS"; do
 done
 
 # Completion behavior order:
-zstyle ':completion:*' completer _list _expand _match _complete _ignored _prefix
+# _complete: Standard completion (commands, paths, arguments)
+# _ignored: Retry with previously ignored matches
+zstyle ':completion:*' completer _complete _ignored
 # Smarter partial matching for path components and case-insensitive matches
 zstyle ':completion:*' matcher-list \
   'm:{a-z}={A-Za-z}' \
   'r:|[._-]=** r:|=**'
 zstyle ':completion:*' squeeze-slashes true
 zstyle ':completion:*' list-suffixes true
-zstyle ':completion:*' completions 10   # Limit completion suggestions
 zstyle ':completion:*' glob 1           # Advanced pattern matching in completions
 
 # Configure the prompt shown when scrolling through completion options
@@ -120,9 +120,9 @@ zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file locatio
 
 # Load and initialize the completion system
 # -U: Suppress alias expansion during function loading
-# -z: Use zsh style autoloading
-# -C: Skip security checks for faster loading
-autoload -Uz compinit && compinit -C
+# compinit performs security check on first run, then uses cached .zcompdump
+# Run `compinit -C` manually to force skip check if you trust all completion files
+autoload -Uz compinit && compinit
 
 # -----------------------------------------------------------------------------
 # rsyncx — robust, resumable directory sync over SSH

@@ -101,7 +101,8 @@ set statusline +=\ %v                           "virtual column number
 set statusline +=x%l/%L                         "current line/total lines
 set statusline +=\ 0x%04B                       "character under cursor
 
-autocmd BufWritePre * :%s/\s\+$//e
+" Strip trailing whitespace on save for code files only
+autocmd BufWritePre *.c,*.cpp,*.h,*.py,*.js,*.ts,*.go,*.rs,*.java,*.sh,*.zsh,*.vim :%s/\s\+$//e
 
 "buftabs
 noremap <f1> :bprev<CR>
