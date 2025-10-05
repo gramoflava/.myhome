@@ -226,12 +226,12 @@ RSYNC_OPTS=(
     --info=progress2
     --partial
     --inplace
-    --timeout=60
     --mkpath
 )
 
 if [[ $IS_REMOTE -eq 1 ]]; then
     RSYNC_OPTS+=(-e "ssh -p ${SSH_PORT}")
+    RSYNC_OPTS+=(--timeout=60)  # Timeout only for remote transfers
 fi
 
 if [[ $USE_CHECKSUM -eq 1 ]]; then
