@@ -52,8 +52,8 @@ DEFAULT_CRF_HEVC = 29
 logger = logging.getLogger(__name__)
 
 def setup_logging(log_path=None):
-    logger.handlers = []            # убрать любые существующие хендлеры
-    logger.propagate = False        # не пускать сообщения к root-логгеру
+    logger.handlers = []            # Remove any existing handlers
+    logger.propagate = False        # Don't propagate messages to root logger
     logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     if log_path is not None:
         file_handler = logging.FileHandler(log_path)
@@ -163,9 +163,8 @@ def is_videotoolbox_available():
     res = run_command(["ffmpeg", "-encoders"])
     return "videotoolbox" in res.stdout
 
-def build_ffmpeg_command(src, codec, fmt, bitrate=None, is_cpu=None, crf_value=None, dynamic_bitrate=None):
+def build_ffmpeg_command(src, codec, fmt, is_cpu=None, crf_value=None, dynamic_bitrate=None):
     src = Path(src)
-    vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
     out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
 
     # Determine if we should use CPU (libx264/libx265) or GPU (videotoolbox).
@@ -289,7 +288,7 @@ def process_video_refine(src, codec, fmt, is_cpu=None):
     # For AMV and loop_audio, behavior is unchanged (handled outside)
     # For refine: pass new crf_value/dynamic_bitrate
     cmd, out = build_ffmpeg_command(
-        src, codec, fmt, dynamic_bitrate if not is_cpu else None,
+        src, codec, fmt,
         is_cpu=is_cpu, crf_value=crf_value, dynamic_bitrate=dynamic_bitrate
     )
     logger.info("Running: " + " ".join(cmd))
@@ -736,7 +735,6 @@ def main():
       - These files are NOT created at start. They are only created/updated if the run exceeds 3 minutes.
       - At the end, if these files exist and there were no errors, they are deleted.
     """
-    import time
     global ENABLE_LOGGING, TRASH_MODE, DEBUG_MODE, DRY_RUN, SUFFIX
     p = argparse.ArgumentParser(
         description=(
@@ -889,7 +887,6 @@ def main():
     failed = 0
     skipped = 0
 
-    import time
     process_start = time.time()
 
     # Process each file
