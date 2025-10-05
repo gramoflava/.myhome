@@ -1,0 +1,220 @@
+#!/usr/bin/env zsh
+# rsyncx — robust, resumable directory sync over SSH with smart defaults
+
+set -e
+
+# ANSI colors for output
+COLOR_RESET="\x1b[0m"
+COLOR_RED="\x1b[31m"
+COLOR_YELLOW="\x1b[33m"
+COLOR_GREEN="\x1b[32m"
+COLOR_BLUE="\x1b[34m"
+
+color_tag() {
+    local tag="$1"
+    local color="$2"
+    if [[ -t 2 ]]; then
+        echo -n "${color}${tag}${COLOR_RESET}"
+    else
+        echo -n "$tag"
+    fi
+}
+
+print_error() {
+    echo "$(color_tag "ERROR" "$COLOR_RED"): $*" >&2
+}
+
+print_warning() {
+    echo "$(color_tag "WARN" "$COLOR_YELLOW"): $*" >&2
+}
+
+print_info() {
+    echo "$(color_tag "INFO" "$COLOR_BLUE"): $*" >&2
+}
+
+print_success() {
+    echo "$(color_tag "OK" "$COLOR_GREEN"): $*" >&2
+}
+
+usage() {
+    cat << 'EOF'
+rsyncx - Robust, resumable directory sync over SSH
+
+Usage:
+    rsyncx [OPTIONS] SOURCE DESTINATION
+
+Arguments:
+    SOURCE          Source directory (local or remote user@host:/path)
+    DESTINATION     Destination directory (local or remote user@host:/path)
+
+Options:
+    -p, --port PORT        SSH port (default: 22, or $RSYNC_SSH_PORT)
+    -n, --dry-run          Show what would be transferred without doing it
+    --no-delete            Keep extra files in DEST (default: delete for exact mirror)
+    --no-checksum          Skip checksum verification (faster, less safe)
+    -v, --verbose          Show detailed transfer information
+    -h, --help             Show this help message
+
+Environment Variables:
+    RSYNC_SSH_PORT         Default SSH port (overridden by -p/--port)
+
+Examples:
+    # Sync local directory to remote server
+    rsyncx ~/Documents/ user@server:~/backup/
+
+    # Sync from remote to local with custom SSH port
+    rsyncx -p 2222 user@server:/data/ ~/local-data/
+
+    # Dry run to see what would be transferred
+    rsyncx -n ~/src/ user@server:~/dest/
+
+    # Keep extra files on destination (don't delete)
+    rsyncx --no-delete ~/source/ user@server:~/dest/
+
+Notes:
+    • Trailing slash matters: "SRC/" copies contents, "SRC" creates subdirectory
+    • Requires rsync 3.1.0+ (use Homebrew on macOS, not built-in 2.6.9)
+    • Uses checksums (-c) by default for data integrity verification
+    • Partial transfers are automatically resumed if interrupted
+    • Creates destination path if missing (--mkpath)
+
+EOF
+}
+
+# Parse arguments
+SSH_PORT="${RSYNC_SSH_PORT:-22}"
+DRY_RUN=0
+DELETE=1  # Default: delete for exact mirror
+USE_CHECKSUM=1
+VERBOSE=0
+SOURCE=""
+DESTINATION=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -p|--port)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                print_error "Option $1 requires an argument"
+                exit 1
+            fi
+            SSH_PORT="$2"
+            shift 2
+            ;;
+        -n|--dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --no-delete)
+            DELETE=0
+            shift
+            ;;
+        --no-checksum)
+            USE_CHECKSUM=0
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -*)
+            print_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$SOURCE" ]]; then
+                SOURCE="$1"
+            elif [[ -z "$DESTINATION" ]]; then
+                DESTINATION="$1"
+            else
+                print_error "Too many arguments"
+                usage
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [[ -z "$SOURCE" || -z "$DESTINATION" ]]; then
+    print_error "Both SOURCE and DESTINATION are required"
+    usage
+    exit 1
+fi
+
+# Check if rsync is available and version
+if ! command -v rsync >/dev/null 2>&1; then
+    print_error "rsync not found. Install it first:"
+    echo "  macOS:  brew install rsync" >&2
+    echo "  Linux:  apt install rsync / yum install rsync" >&2
+    exit 1
+fi
+
+RSYNC_VERSION=$(rsync --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [[ -n "$RSYNC_VERSION" ]]; then
+    RSYNC_MAJOR=$(echo "$RSYNC_VERSION" | cut -d. -f1)
+    RSYNC_MINOR=$(echo "$RSYNC_VERSION" | cut -d. -f2)
+
+    if [[ "$RSYNC_MAJOR" -lt 3 || ("$RSYNC_MAJOR" -eq 3 && "$RSYNC_MINOR" -lt 1) ]]; then
+        print_warning "rsync version $RSYNC_VERSION detected (3.1.0+ recommended)"
+        print_warning "macOS built-in rsync is outdated. Install via: brew install rsync"
+    fi
+fi
+
+# Build rsync command
+RSYNC_OPTS=(
+    -avh
+    --info=progress2
+    --partial
+    --inplace
+    --timeout=60
+    --mkpath
+    -e "ssh -p ${SSH_PORT}"
+)
+
+if [[ $USE_CHECKSUM -eq 1 ]]; then
+    RSYNC_OPTS+=(-c)
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    RSYNC_OPTS+=(--dry-run)
+    print_info "DRY RUN - No files will be transferred"
+fi
+
+if [[ $DELETE -eq 1 ]]; then
+    RSYNC_OPTS+=(--delete-delay)
+else
+    print_info "Preserving extra files in DEST (exact mirror disabled)"
+fi
+
+if [[ $VERBOSE -eq 1 ]]; then
+    RSYNC_OPTS+=(--progress)
+fi
+
+# Show transfer summary
+print_info "Transfer configuration:"
+echo "  Source:      $SOURCE" >&2
+echo "  Destination: $DESTINATION" >&2
+echo "  SSH port:    $SSH_PORT" >&2
+echo "  Checksum:    $([ $USE_CHECKSUM -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
+echo "  Delete:      $([ $DELETE -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
+echo >&2
+
+# Execute rsync
+if rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DESTINATION"; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+        print_success "Dry run completed"
+    else
+        print_success "Transfer completed successfully"
+    fi
+    exit 0
+else
+    EXIT_CODE=$?
+    print_error "Transfer failed with exit code $EXIT_CODE"
+    exit $EXIT_CODE
+fi

@@ -123,24 +123,3 @@ zstyle :compinstall filename '$HOME/.zshrc'     # Set configuration file locatio
 # compinit performs security check on first run, then uses cached .zcompdump
 # Run `compinit -C` manually to force skip check if you trust all completion files
 autoload -Uz compinit && compinit
-
-# -----------------------------------------------------------------------------
-# rsyncx — robust, resumable directory sync over SSH
-# Usage:
-#   rsyncx SRC/ DEST/ [extra rsync args...]
-# Notes:
-#   • (!) Requires rsync from Homebrew or similar (v3.1.0+), not macOS built-in (v2.6.9).
-#   • Trailing slash semantics matter: "SRC/" copies contents, "SRC" creates a subdir.
-#   • Uses checksums (-c) + --inplace --partial for resumable transfers of large files.
-#   • Creates destination path if missing (--mkpath). Shows one-line progress per file.
-#   • Set RSYNC_SSH_PORT to override SSH port (default 22).
-#   • Pass any additional rsync flags after DEST (e.g., --exclude, --include).
-rsyncx() {
-  local SSH_PORT="${RSYNC_SSH_PORT:-22}"
-  rsync -avhc --info=progress2 \
-    --inplace --partial \
-    --delete-delay --timeout=60 \
-    --mkpath \
-    -e "ssh -p ${SSH_PORT}" \
-    "$@"
-}

@@ -74,8 +74,10 @@ Run without arguments to access the interactive configuration manager:
 - `zsh-completions` - Additional shell completions
 - `ffmpeg` - Media processor
 
-### Custom Features
-- **rsyncx** - Robust, resumable directory sync over SSH with smart defaults
+### Custom Tools & Features
+- **rsyncx** - Standalone CLI tool for robust, resumable directory sync over SSH (see below)
+- **automat.py** - Video transcoding automation tool with smart quality presets
+- **png2icns.py** - Convert PNG images to macOS .icns format
 - **Path expansion** - Type `/o/a/c<Tab>` to expand to `/opt/ai-stack/compose`
 - **Smart history** - 5000 entries, ignores common commands, shares across sessions
 - **Custom keyboard layout** - ERDB layout for macOS (optional)
@@ -89,6 +91,51 @@ If you previously used symlinks for `.zshrc` or `.zprofile`, the configuration m
 ```
 
 This prevents external tools (like `oh-my-zsh`, language installers, etc.) from modifying your repository when they append configurations.
+
+## Custom Tools
+
+### rsyncx - Robust SSH Sync
+
+Standalone CLI tool for reliable, resumable file transfers over SSH with smart defaults.
+
+**Features:**
+- **Exact mirror by default** - Deletes files on destination that don't exist in source
+- Automatic resume of interrupted transfers
+- Checksum verification for data integrity
+- Progress monitoring
+- Dry-run mode to preview transfers
+- SSH port configuration
+
+**Usage:**
+
+```bash
+# Basic sync
+rsyncx ~/source/ user@server:~/dest/
+
+# Custom SSH port
+rsyncx -p 2222 ~/data/ user@server:~/backup/
+
+# Dry run (preview what would be transferred)
+rsyncx -n ~/files/ user@server:~/files/
+
+# Keep extra files on destination (disable exact mirror)
+rsyncx --no-delete ~/source/ ~/destination/
+
+# Skip checksum verification (faster, less safe)
+rsyncx --no-checksum ~/large-files/ user@server:~/backup/
+
+# Verbose output
+rsyncx -v ~/data/ user@server:~/data/
+```
+
+**Important notes:**
+- Trailing slash matters: `source/` copies contents, `source` creates subdirectory
+- Requires rsync 3.1.0+ (macOS: `brew install rsync`)
+- Set `RSYNC_SSH_PORT` environment variable for default port
+
+**Full help:** `rsyncx --help`
+
+---
 
 ## Useful Commands
 
@@ -104,6 +151,10 @@ rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N "" -f 
 
 ```
 .myhome/
+├── bin/
+│   ├── rsyncx         # Robust SSH sync tool
+│   ├── automat.py     # Video transcoding automation
+│   └── png2icns.py    # PNG to macOS icon converter
 ├── cfg/
 │   ├── zprofile       # Login shell configuration
 │   ├── zshrc          # Interactive shell configuration
