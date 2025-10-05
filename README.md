@@ -109,8 +109,11 @@ Standalone CLI tool for reliable, resumable file transfers over SSH with smart d
 **Usage:**
 
 ```bash
-# Basic sync
+# Sync to remote server
 rsyncx ~/source/ user@server:~/dest/
+
+# Local directory sync (creates exact mirror)
+rsyncx ~/source/ ~/backup/
 
 # Custom SSH port
 rsyncx -p 2222 ~/data/ user@server:~/backup/
@@ -126,6 +129,12 @@ rsyncx --no-checksum ~/large-files/ user@server:~/backup/
 
 # Verbose output
 rsyncx -v ~/data/ user@server:~/data/
+
+# Copy to docker directory (automatically matches owner with sudo)
+sudo rsyncx ~/models/ /var/lib/docker/volumes/data/
+
+# Disable automatic owner matching
+rsyncx --no-match-owner ~/source/ /destination/
 ```
 
 **Important notes:**

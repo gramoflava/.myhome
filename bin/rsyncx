@@ -52,6 +52,7 @@ Options:
     -n, --dry-run          Show what would be transferred without doing it
     --no-delete            Keep extra files in DEST (default: delete for exact mirror)
     --no-checksum          Skip checksum verification (faster, less safe)
+    --no-match-owner       Don't match destination owner (default: match for local)
     -v, --verbose          Show detailed transfer information
     -h, --help             Show this help message
 
@@ -65,11 +66,20 @@ Examples:
     # Sync from remote to local with custom SSH port
     rsyncx -p 2222 user@server:/data/ ~/local-data/
 
+    # Local directory sync (creates exact mirror)
+    rsyncx ~/source/ ~/backup/
+
     # Dry run to see what would be transferred
     rsyncx -n ~/src/ user@server:~/dest/
 
     # Keep extra files on destination (don't delete)
-    rsyncx --no-delete ~/source/ user@server:~/dest/
+    rsyncx --no-delete ~/source/ ~/destination/
+
+    # Copy to docker directory (automatically matches owner, needs sudo)
+    sudo rsyncx ~/models/ /var/lib/docker/volumes/data/
+
+    # Disable owner matching
+    rsyncx --no-match-owner ~/source/ /destination/
 
 Notes:
     • Trailing slash matters: "SRC/" copies contents, "SRC" creates subdirectory
@@ -86,6 +96,7 @@ SSH_PORT="${RSYNC_SSH_PORT:-22}"
 DRY_RUN=0
 DELETE=1  # Default: delete for exact mirror
 USE_CHECKSUM=1
+MATCH_OWNER=1  # Default: match owner for local transfers
 VERBOSE=0
 SOURCE=""
 DESTINATION=""
@@ -114,6 +125,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-checksum)
             USE_CHECKSUM=0
+            shift
+            ;;
+        --no-match-owner)
+            MATCH_OWNER=0
             shift
             ;;
         -v|--verbose)
@@ -166,6 +181,45 @@ if [[ -n "$RSYNC_VERSION" ]]; then
     fi
 fi
 
+# Detect if this is a remote transfer (contains : but not local path like C:)
+IS_REMOTE=0
+if [[ "$SOURCE" == *:* && ! "$SOURCE" =~ ^[A-Za-z]:[/\\] ]] || \
+   [[ "$DESTINATION" == *:* && ! "$DESTINATION" =~ ^[A-Za-z]:[/\\] ]]; then
+    IS_REMOTE=1
+fi
+
+# Get destination owner if --match-owner is set
+CHOWN_ARG=""
+if [[ $MATCH_OWNER -eq 1 ]]; then
+    if [[ $IS_REMOTE -eq 1 ]]; then
+        print_warning "--match-owner only works for local destinations, ignoring"
+    else
+        # Extract base directory (remove trailing slash)
+        DEST_DIR="${DESTINATION%/}"
+
+        # Check if destination exists
+        if [[ -d "$DEST_DIR" ]]; then
+            # Get owner:group using stat
+            if [[ "$OSTYPE" == darwin* ]]; then
+                # macOS stat format
+                DEST_OWNER=$(stat -f "%u:%g" "$DEST_DIR" 2>/dev/null)
+            else
+                # Linux stat format
+                DEST_OWNER=$(stat -c "%u:%g" "$DEST_DIR" 2>/dev/null)
+            fi
+
+            if [[ -n "$DEST_OWNER" ]]; then
+                CHOWN_ARG="$DEST_OWNER"
+                print_info "Will set ownership to $DEST_OWNER (from destination directory)"
+            else
+                print_warning "Could not determine destination owner, skipping --match-owner"
+            fi
+        else
+            print_warning "Destination does not exist yet, cannot match owner"
+        fi
+    fi
+fi
+
 # Build rsync command
 RSYNC_OPTS=(
     -avh
@@ -174,11 +228,18 @@ RSYNC_OPTS=(
     --inplace
     --timeout=60
     --mkpath
-    -e "ssh -p ${SSH_PORT}"
 )
+
+if [[ $IS_REMOTE -eq 1 ]]; then
+    RSYNC_OPTS+=(-e "ssh -p ${SSH_PORT}")
+fi
 
 if [[ $USE_CHECKSUM -eq 1 ]]; then
     RSYNC_OPTS+=(-c)
+fi
+
+if [[ -n "$CHOWN_ARG" ]]; then
+    RSYNC_OPTS+=(--chown="$CHOWN_ARG")
 fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -200,7 +261,11 @@ fi
 print_info "Transfer configuration:"
 echo "  Source:      $SOURCE" >&2
 echo "  Destination: $DESTINATION" >&2
-echo "  SSH port:    $SSH_PORT" >&2
+if [[ $IS_REMOTE -eq 1 ]]; then
+    echo "  SSH port:    $SSH_PORT" >&2
+else
+    echo "  Mode:        Local" >&2
+fi
 echo "  Checksum:    $([ $USE_CHECKSUM -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
 echo "  Delete:      $([ $DELETE -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
 echo >&2
