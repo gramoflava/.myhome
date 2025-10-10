@@ -53,6 +53,7 @@ Options:
     --no-delete            Keep extra files in DEST (default: delete for exact mirror)
     --no-checksum          Skip checksum verification (faster, less safe)
     --no-match-owner       Don't match destination owner (default: match for local)
+    --preserve-times       Preserve modification times (default: disabled)
     -v, --verbose          Show detailed transfer information
     -h, --help             Show this help message
 
@@ -97,6 +98,7 @@ DRY_RUN=0
 DELETE=1  # Default: delete for exact mirror
 USE_CHECKSUM=1
 MATCH_OWNER=1  # Default: match owner for local transfers
+PRESERVE_TIMES=0  # Default: don't preserve times (avoids permission errors)
 VERBOSE=0
 SOURCE=""
 DESTINATION=""
@@ -129,6 +131,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-match-owner)
             MATCH_OWNER=0
+            shift
+            ;;
+        --preserve-times)
+            PRESERVE_TIMES=1
             shift
             ;;
         -v|--verbose)
@@ -236,6 +242,10 @@ fi
 
 if [[ $USE_CHECKSUM -eq 1 ]]; then
     RSYNC_OPTS+=(-c)
+fi
+
+if [[ $PRESERVE_TIMES -eq 0 ]]; then
+    RSYNC_OPTS+=(--no-times)
 fi
 
 if [[ -n "$CHOWN_ARG" ]]; then
