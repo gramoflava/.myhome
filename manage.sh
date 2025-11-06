@@ -180,44 +180,48 @@ init() {
     ln -sf "$BASEDIR/cfg/tmux.conf" "$HOME/.tmux.conf" 2>/dev/null || \
         echo "WARN: Failed to link $HOME/.tmux.conf, it may already exist."
 
-    # Core utilities
-    echo "INFO: Core utilities"
-    typeset -A brew_packages
-    brew_packages=(
-        bat       "Better cat with syntax highlighting"
-        fd        "Modern find alternative"
-        ripgrep   "Fast grep alternative"
-        tree      "Directory structure viewer"
-        jq        "JSON processor"
-        tig       "Text-mode interface for git"
-        zsh-completions "Additional completions"
-        ffmpeg    "Media processor"
-    )
+    # Core utilities (macOS only)
+    if [[ "$OSTYPE" == darwin* ]]; then
+        echo "INFO: Core utilities"
+        typeset -A brew_packages
+        brew_packages=(
+            bat       "Better cat with syntax highlighting"
+            fd        "Modern find alternative"
+            ripgrep   "Fast grep alternative"
+            tree      "Directory structure viewer"
+            jq        "JSON processor"
+            tig       "Text-mode interface for git"
+            zsh-completions "Additional completions"
+            ffmpeg    "Media processor"
+        )
 
-    # Init or install Homebrew if missing
-    if ! command -v brew >/dev/null 2>&1; then
-        echo "WARN: Homebrew not detected. Looking..."
-        if [ -x /opt/homebrew/bin/brew ]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-        elif [ -x /usr/local/bin/brew ]; then
-            eval "$(/usr/local/bin/brew shellenv)"
-        else
-            echo "WARN: Homebrew not found. Installing..."
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
+        # Init or install Homebrew if missing
+        if ! command -v brew >/dev/null 2>&1; then
+            echo "WARN: Homebrew not detected. Looking..."
             if [ -x /opt/homebrew/bin/brew ]; then
                 eval "$(/opt/homebrew/bin/brew shellenv)"
             elif [ -x /usr/local/bin/brew ]; then
                 eval "$(/usr/local/bin/brew shellenv)"
+            else
+                echo "WARN: Homebrew not found. Installing..."
+                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+                if [ -x /opt/homebrew/bin/brew ]; then
+                    eval "$(/opt/homebrew/bin/brew shellenv)"
+                elif [ -x /usr/local/bin/brew ]; then
+                    eval "$(/usr/local/bin/brew shellenv)"
+                fi
             fi
+
+            echo "INFO: Proceeding with installation..."
         fi
 
-        echo "INFO: Proceeding with installation..."
+        # Install required Brew packages
+        brew install ${(k)brew_packages}
+        echo "INFO: Core packages installation completed."
+    else
+        echo "INFO: Skipping Homebrew installation (macOS only)"
     fi
-
-    # Install required Brew packages
-    brew install ${(k)brew_packages}
-    echo "INFO: Core packages installation completed."
 }
 
 kbd_install() {
