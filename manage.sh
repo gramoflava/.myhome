@@ -54,6 +54,15 @@ check_status() {
         issues+=("~/.vimrc not configured")
     fi
 
+    # Check .tmux.conf (symlink is OK)
+    if [ -L "$HOME/.tmux.conf" ] && [ "$(readlink "$HOME/.tmux.conf")" = "$BASEDIR/cfg/tmux.conf" ]; then
+        status_ok+=("✓ ~/.tmux.conf symlinked correctly")
+    elif [ -f "$HOME/.tmux.conf" ]; then
+        issues+=("~/.tmux.conf exists but not linked to config")
+    else
+        issues+=("~/.tmux.conf not configured")
+    fi
+
     # Check keyboard layout (macOS only)
     if [[ "$OSTYPE" == darwin* ]]; then
         if [ -d "/Library/Keyboard Layouts/$KBD_LAYOUT_NAME" ]; then
@@ -166,6 +175,10 @@ init() {
     echo "INFO: Vimrc"
     ln -sf "$BASEDIR/cfg/vimrc" "$HOME/.vimrc" 2>/dev/null || \
         echo "WARN: Failed to link $HOME/.vimrc, it may already exist."
+
+    echo "INFO: Tmux.conf"
+    ln -sf "$BASEDIR/cfg/tmux.conf" "$HOME/.tmux.conf" 2>/dev/null || \
+        echo "WARN: Failed to link $HOME/.tmux.conf, it may already exist."
 
     # Core utilities
     echo "INFO: Core utilities"

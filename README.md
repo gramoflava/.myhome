@@ -61,6 +61,7 @@ Run without arguments to access the interactive configuration manager:
 - `~/.zprofile` - Login shell configuration (sources `cfg/zprofile`)
 - `~/.zshrc` - Interactive shell configuration (sources `cfg/zshrc`)
 - `~/.vimrc` - Vim configuration (symlinked to `cfg/vimrc`)
+- `~/.tmux.conf` - Tmux configuration (symlinked to `cfg/tmux.conf`)
 
 **Note:** Shell configs use `source` instead of symlinks to prevent external tools from modifying the repository when they append their own configurations.
 
@@ -168,6 +169,7 @@ rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N "" -f 
 │   ├── zprofile       # Login shell configuration
 │   ├── zshrc          # Interactive shell configuration
 │   ├── vimrc          # Vim configuration
+│   ├── tmux.conf      # Tmux configuration
 │   └── kbd/           # Custom keyboard layouts
 ├── manage.sh          # Configuration manager
 └── README.md          # This file

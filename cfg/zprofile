@@ -3,7 +3,10 @@
 
 # Defaults
 setopt EXTENDED_GLOB     # Enable ^negation, etc., in glob patterns
-setopt NO_UNSET          # Error if you reference an undefined variable
+# Temporarily disable NO_UNSET in tmux to avoid terminfo errors from /etc/zshrc
+if [[ "$TERM" != "tmux-"* && "$TERM" != "screen-"* ]]; then
+    setopt NO_UNSET      # Error if you reference an undefined variable
+fi
 
 # suppress compinit warning
 typeset -g skip_global_compinit=1
