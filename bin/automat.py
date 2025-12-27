@@ -733,6 +733,86 @@ def process_image(src):
         move_to_trash(src)
     return True
 
+def process_portrait(src):
+    """Generate Baldur's Gate portrait sizes as 24-bit BMPs."""
+    src = Path(src)
+    portraits_dir = src.parent / "Portraits"
+    if DRY_RUN:
+        display_info(f"[DRY RUN] Would create folder: {portraits_dir}")
+    else:
+        try:
+            portraits_dir.mkdir(exist_ok=True)
+        except Exception as e:
+            display_error(f"Failed to create Portraits folder: {e}")
+            return False
+
+    sizes = [
+        ("L", 420, 660),
+        ("M", 338, 532),
+        ("S", 108, 168),
+    ]
+
+    success = True
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for suffix, width, height in sizes:
+            temp_resample = tmpdir_path / f"{src.stem}_{suffix}_resample.png"
+            temp_cropped = tmpdir_path / f"{src.stem}_{suffix}_crop.png"
+            out = portraits_dir / f"{src.stem}{suffix}.bmp"
+
+            cmd_resample = ["sips", "--resampleHeight", str(height), str(src), "--out", str(temp_resample)]
+            logger.info("Running: " + " ".join(cmd_resample))
+            res = run_command(cmd_resample)
+            if res.returncode != 0 and not DRY_RUN:
+                display_error("sips resample failed")
+                success = False
+                break
+
+            cmd_crop_png = [
+                "sips",
+                "--cropToHeightWidth", str(height), str(width),
+                "-s", "format", "png",
+                str(temp_resample),
+                "--out", str(temp_cropped),
+            ]
+            logger.info("Running: " + " ".join(cmd_crop_png))
+            res = run_command(cmd_crop_png)
+            if res.returncode != 0 and not DRY_RUN:
+                display_error("sips crop failed")
+                success = False
+                break
+
+            cmd_bmp = [
+                "ffmpeg",
+                "-y",
+                "-i", str(temp_cropped),
+                "-vf", "format=bgr24",
+                str(out),
+            ]
+            logger.info("Running: " + " ".join(cmd_bmp))
+            ffmpeg_path = shutil.which("ffmpeg")
+            if not ffmpeg_path and not DRY_RUN:
+                display_error("ffmpeg not found (required for 24-bit BMP output)")
+                success = False
+                break
+            if ffmpeg_path:
+                cmd_bmp[0] = ffmpeg_path
+            res = run_command(cmd_bmp)
+            if res.returncode != 0 and not DRY_RUN:
+                display_error("ffmpeg bmp conversion failed")
+                success = False
+                break
+            if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+                display_error(f"Output missing: {out}")
+                success = False
+                break
+
+            display_info(f"Portrait created: {out}")
+
+    if success and TRASH_MODE:
+        move_to_trash(src)
+    return success
+
 def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=None):
     """Process a single file with the specified operations"""
     file_path = Path(file_path)
@@ -770,6 +850,8 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
             elif operation == "audiofy":
                 if not process_video_audiofy(file_path, codec, fmt):
                     success = False
+            elif operation == "portrait":
+                display_info(f"Skipping portrait for video: {file_path}")
 
     elif is_image_file(file_path):
         display_info(f"Processing image: {file_path}")
@@ -777,11 +859,14 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
             if operation == "refine":
                 if not process_image(file_path):
                     success = False
+            elif operation == "portrait":
+                if not process_portrait(file_path):
+                    success = False
             elif operation == "audiofy" and audio_track:
                 if not process_image_audiofy(file_path, audio_track, codec, fmt):
                     success = False
             else:
-                if operation not in ("refine", "audiofy"):
+                if operation not in ("refine", "audiofy", "portrait"):
                     display_info(f"Skipping image (no supported operations): {file_path}")
     else:
         display_error(f"Unsupported file type: {file_path}")
@@ -1034,6 +1119,7 @@ class InteractiveMode:
         print("3. Loop audio to match video length")
         print("4. Extract audio to MP3")
         print("5. Create video from image + audio")
+        print("6. Create Baldur's Gate portraits from images")
         print()
 
         choice = input("Choice [1]: ").strip() or "1"
@@ -1082,6 +1168,8 @@ class InteractiveMode:
                 print(f"Error: Audio file not found: {audio}")
                 return (["refine"], config)
             operations.append("audiofy")
+        elif choice == "6":
+            operations.append("portrait")
 
         else:
             print(f"Invalid choice: {choice}, defaulting to refine")
@@ -1177,6 +1265,8 @@ def main():
                    help="Loop audio to match video duration")
     p.add_argument("--audiofy", action="store_true",
                    help="Extract audio from video as MP3, or create video from image+audio")
+    p.add_argument("--portrait", action="store_true",
+                   help="Generate Baldur's Gate portrait sizes from images")
 
     # Quality presets
     p.add_argument("--preset", choices=["meme", "share", "archive"], default="share",
@@ -1257,6 +1347,8 @@ def main():
             operations.append("loop_audio")
         if args.audiofy:
             operations.append("audiofy")
+        if args.portrait:
+            operations.append("portrait")
 
         # Default to refine if no operations specified
         if not operations:
