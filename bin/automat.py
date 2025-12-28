@@ -1985,16 +1985,6 @@ class ProgressTracker:
             size_bytes /= 1024
         return f"{size_bytes:.1f} TB"
 
-    def cleanup_if_successful(self):
-        """Remove progress file if no failures"""
-        failed = sum(1 for f in self.files.values() if f.status == "Failed")
-        if failed == 0:
-            path = self.get_progress_filename()
-            if path.exists():
-                try:
-                    path.unlink()
-                except Exception as e:
-                    display_error(f"Failed to remove progress file: {e}")
 
 def main():
     """
@@ -2304,18 +2294,7 @@ def main():
     if not config.dry_run and total_files > 1:
         notify("Automat", f"Processed {processed} files, {failed} failed")
 
-    # Cleanup progress tracker if successful
-    if tracker and not config.dry_run:
-        tracker.cleanup_if_successful()
-
-    # If there were no errors and logging was enabled, delete raw log file
-    if config.log and not config.dry_run and failed == 0:
-        raw_log_file = base_path / f"automat-{_SESSION_CODE}-raw.log"
-        if raw_log_file.exists():
-            try:
-                raw_log_file.unlink()
-            except Exception as e:
-                display_error(f"Failed to remove log file {raw_log_file}: {e}")
+    # Progress and log files are kept for user review - no automatic cleanup
 
     return 0 if failed == 0 else 1
 
