@@ -129,13 +129,13 @@ class MediaFile:
 
     def __init__(self, path: Path):
         self.path = path if isinstance(path, Path) else Path(path)
-        self._mime_type: Optional[str] = None
+        self._mime_type: str = ""
         self._video_info: Optional[VideoInfo] = None
 
     @property
     def mime_type(self) -> str:
         """Cached MIME type detection"""
-        if self._mime_type is None:
+        if not self._mime_type:
             if not self.path.is_file():
                 self._mime_type = ""
             else:
