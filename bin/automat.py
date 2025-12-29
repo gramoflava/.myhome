@@ -591,21 +591,29 @@ def finalize_processed_output(
     final_out: Path,
     config: Config,
     metadata: dict,
+    rename_original: bool = False,
 ) -> bool:
     """
     Finalize processed output with atomic operations and full rollback on failure.
     Steps:
       1. Verify metadata is present in temp_out
-      2. Rename src -> ~src (prefixed original)
+      2. Rename src -> ~src (prefixed original) - only if rename_original=True
       3. Move temp_out -> final_out
       4. Optionally trash prefixed original
 
     On failure, attempt to restore original state.
+
+    Args:
+        rename_original: If True, rename source to ~source (for refine operation).
+                        If False (default), keep original untouched (for amv/portrait/audiofy operations).
     """
-    prefixed_src = prefixed_original_path(src)
+    prefixed_src = prefixed_original_path(src) if rename_original else None
 
     if config.dry_run:
-        display_info(f"[DRY RUN] Would finalize: {src} -> {prefixed_src}, {temp_out} -> {final_out}")
+        if rename_original:
+            display_info(f"[DRY RUN] Would finalize: {src} -> {prefixed_src}, {temp_out} -> {final_out}")
+        else:
+            display_info(f"[DRY RUN] Would finalize: {temp_out} -> {final_out} (keeping {src})")
         unregister_temp_output(temp_out)
         return True
 
@@ -619,9 +627,9 @@ def finalize_processed_output(
     final_out_backup = None
 
     try:
-        # Step 1: Rename source to prefixed FIRST (before any other operations)
+        # Step 1: Rename source to prefixed FIRST (only if rename_original=True)
         # This prevents issues when final_out == src (same base name)
-        if prefixed_src != src:
+        if rename_original and prefixed_src and prefixed_src != src:
             src.replace(prefixed_src)
             src_was_renamed = True
 
@@ -649,8 +657,8 @@ def finalize_processed_output(
             except Exception as restore_error:
                 logger.warning(f"Failed to restore backup: {final_out_backup} -> {final_out} ({restore_error})")
 
-        # 2. Restore src from prefixed_src
-        if src_was_renamed and prefixed_src.exists() and not src.exists():
+        # 2. Restore src from prefixed_src (only if it was renamed)
+        if src_was_renamed and prefixed_src and prefixed_src.exists() and not src.exists():
             try:
                 prefixed_src.replace(src)
             except Exception as restore_error:
@@ -663,7 +671,8 @@ def finalize_processed_output(
     finally:
         unregister_temp_output(temp_out)
 
-    if config.trash:
+    # Move prefixed original to trash if requested (only if original was renamed)
+    if config.trash and rename_original and prefixed_src:
         move_to_trash(prefixed_src)
     return True
 
@@ -1112,7 +1121,7 @@ def process_video_refine(src, config: Config, signature: dict):
     new_sz = temp_out.stat().st_size if not config.dry_run else int(orig_sz * 0.7)  # Estimate for dry run
     red = (1 - new_sz / orig_sz) * 100 if orig_sz > 0 else 0
     display_info(f"{orig_sz/1e6:.2f}→{new_sz/1e6:.2f} MB ({red:.1f}% reduction)")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata)
+    return finalize_processed_output(src, temp_out, final_out, config, metadata, rename_original=True)
 
 def process_video_amv(src, audio_track, config: Config, signature: dict):
     """Add or replace audio track in video (AMV operation)"""
