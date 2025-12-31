@@ -640,7 +640,22 @@ def finalize_processed_output(
             final_out.replace(final_out_backup)
 
         # Step 3: Move temp output to final location
-        temp_out.replace(final_out)
+        try:
+            temp_out.replace(final_out)
+        except OSError as move_error:
+            # If replace fails, try shutil.move as fallback
+            display_debug(f"Path.replace failed ({move_error}), trying shutil.move")
+            try:
+                shutil.move(str(temp_out), str(final_out))
+            except OSError as shutil_error:
+                if shutil_error.errno == 1:  # Operation not permitted
+                    raise OSError(
+                        f"Permission denied when moving file. "
+                        f"If using Automator, grant Full Disk Access in System Settings → Privacy & Security. "
+                        f"Original error: {shutil_error}"
+                    ) from shutil_error
+                else:
+                    raise
 
         # Success - cleanup backup if it exists
         if final_out_backup and final_out_backup.exists():
@@ -671,9 +686,14 @@ def finalize_processed_output(
     finally:
         unregister_temp_output(temp_out)
 
-    # Move prefixed original to trash if requested (only if original was renamed)
-    if config.trash and rename_original and prefixed_src:
-        move_to_trash(prefixed_src)
+    # Move original to trash if requested
+    if config.trash:
+        if rename_original and prefixed_src:
+            # For refine: trash the prefixed original (~src)
+            move_to_trash(prefixed_src)
+        else:
+            # For other operations: trash the original source file
+            move_to_trash(src)
     return True
 
 def cleanup_temp_output(temp_out: Path):
