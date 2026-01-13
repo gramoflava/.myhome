@@ -9,7 +9,7 @@ This directory contains helper utilities for common repetitive tasks. These scri
 
 ## Utilities
 
-- **automat.py** - Automation utility for repetitive system tasks
+- **automat.py** - Media processing tool for optimizing videos and images with ffmpeg/sips
 - **png2icns.py** - Converts PNG images to macOS .icns icon format
 - **rsyncx** - Robust, resumable directory sync over SSH with smart defaults
 
