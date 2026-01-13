@@ -27,6 +27,15 @@ Icon?
 *.sublime-project
 *.sublime-workspace
 
+# AI agent/system-specific configs (keep local)
+.claude/
+.codex/
+.cursor/
+.continue/
+.codeium/
+.aider/
+.copilot/
+
 # Node modules (if using JavaScript)
 node_modules/
 
