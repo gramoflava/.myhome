@@ -1,7 +1,7 @@
 #!/usr/bin/env zsh
 # rsyncx — robust, resumable directory sync over SSH with smart defaults
 
-set -e
+# Don't use set -e, we need to handle rsync exit codes manually
 
 # ANSI colors for output
 COLOR_RESET="\x1b[0m"
@@ -280,16 +280,36 @@ echo "  Checksum:    $([ $USE_CHECKSUM -eq 1 ] && echo 'enabled' || echo 'disabl
 echo "  Delete:      $([ $DELETE -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
 echo >&2
 
-# Execute rsync
-if rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DESTINATION"; then
+# Execute rsync and capture output to check for permission-only errors
+RSYNC_OUTPUT=$(mktemp)
+trap "rm -f '$RSYNC_OUTPUT'" EXIT
+
+rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DESTINATION" 2>&1 | tee "$RSYNC_OUTPUT"
+EXIT_CODE=${pipestatus[1]}
+
+# Check the exit code and handle different scenarios
+if [[ $EXIT_CODE -eq 0 ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
         print_success "Dry run completed"
     else
         print_success "Transfer completed successfully"
     fi
     exit 0
+elif [[ $EXIT_CODE -eq 23 ]]; then
+    # Exit code 23: Partial transfer due to error
+    # Check if it's only permission errors (non-critical)
+    if grep -q "failed to set permissions\|failed to set times\|failed to set owner" "$RSYNC_OUTPUT" && \
+       ! grep -q "failed to open\|No such file\|Permission denied.*read\|failed to read\|failed to write\|failed to send\|failed to receive" "$RSYNC_OUTPUT"; then
+        print_warning "Transfer completed with permission/attribute warnings (non-critical)"
+        print_info "Files were transferred successfully, but some permissions/attributes could not be set"
+        exit 0
+    else
+        # Real errors beyond just permissions
+        print_error "Transfer failed with exit code $EXIT_CODE"
+        exit $EXIT_CODE
+    fi
 else
-    EXIT_CODE=$?
+    # Other error codes
     print_error "Transfer failed with exit code $EXIT_CODE"
     exit $EXIT_CODE
 fi
