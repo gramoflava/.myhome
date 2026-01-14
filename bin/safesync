@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# rsyncx — robust, resumable directory sync over SSH with smart defaults
+# safesync — robust, resumable directory sync over SSH with smart defaults
 
 # Don't use set -e, we need to handle rsync exit codes manually
 
@@ -38,10 +38,10 @@ print_success() {
 
 usage() {
     cat << 'EOF'
-rsyncx - Robust, resumable directory sync over SSH
+safesync - Robust, resumable directory sync over SSH
 
 Usage:
-    rsyncx [OPTIONS] SOURCE DESTINATION
+    safesync [OPTIONS] SOURCE DESTINATION
 
 Arguments:
     SOURCE          Source directory (local or remote user@host:/path)
@@ -62,25 +62,25 @@ Environment Variables:
 
 Examples:
     # Sync local directory to remote server
-    rsyncx ~/Documents/ user@server:~/backup/
+    safesync ~/Documents/ user@server:~/backup/
 
     # Sync from remote to local with custom SSH port
-    rsyncx -p 2222 user@server:/data/ ~/local-data/
+    safesync -p 2222 user@server:/data/ ~/local-data/
 
     # Local directory sync (creates exact mirror)
-    rsyncx ~/source/ ~/backup/
+    safesync ~/source/ ~/backup/
 
     # Dry run to see what would be transferred
-    rsyncx -n ~/src/ user@server:~/dest/
+    safesync -n ~/src/ user@server:~/dest/
 
     # Keep extra files on destination (don't delete)
-    rsyncx --no-delete ~/source/ ~/destination/
+    safesync --no-delete ~/source/ ~/destination/
 
     # Copy to docker directory (automatically matches owner, needs sudo)
-    sudo rsyncx ~/models/ /var/lib/docker/volumes/data/
+    sudo safesync ~/models/ /var/lib/docker/volumes/data/
 
     # Disable owner matching
-    rsyncx --no-match-owner ~/source/ /destination/
+    safesync --no-match-owner ~/source/ /destination/
 
 Notes:
     • Trailing slash matters: "SRC/" copies contents, "SRC" creates subdirectory

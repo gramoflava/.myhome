@@ -11,7 +11,7 @@ This directory contains helper utilities for common repetitive tasks. These scri
 
 - **automat.py** - Media processing tool for optimizing videos and images with ffmpeg/sips
 - **png2icns.py** - Converts PNG images to macOS .icns icon format
-- **rsyncx** - Robust, resumable directory sync over SSH with smart defaults
+- **safesync** - Robust, resumable directory sync over SSH with smart defaults
 
 ## Requirements
 
