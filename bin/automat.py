@@ -8,19 +8,19 @@ No external Python dependencies required (only stdlib).
 ARCHITECTURE:
   - Configuration & Presets: Quality presets (meme/share/archive) + Config dataclass
   - Media File Abstraction: MediaFile class with cached metadata + VideoInfo
-  - Processed File Tracking: embedded metadata tag (automat JSON signature)
+  - Processed File Tracking: suffix-based (-re for refined files, -amv for AMV, etc.)
   - Codec Strategies: Pluggable codec strategies (H264/HEVC CPU/GPU, AV1)
   - Operations: Base Operation class for refine/amv/audiofy/loop_audio
   - Interactive Mode: Guided prompts for rare operations
   - CLI Interface: Simplified argument parsing with preset support
 
 USAGE:
-  Most common: automat.py video.mp4                        # Quick refine with defaults
+  Most common: automat.py video.mp4                        # Quick refine (creates video-re.mp4)
   Memes:       automat.py --preset meme funny.mp4          # Smallest size
-  Batch:       automat.py -t ~/Downloads/videos/           # Process folder, trash backups
+  Batch:       automat.py -t ~/Downloads/videos/           # Process folder, trash originals
   Interactive: automat.py -i video.mp4                     # Guided prompts
   Auto:        automat.py --auto large_file.mov            # Auto-detect best preset
-  AMV:         automat.py --amv video.mov -a audio.mp3    # Add audio (creates video-amv.mov)
+  AMV:         automat.py --amv video.mov -a audio.mp3    # Add audio (creates video-amv.mp4)
   Extract:     automat.py --audiofy video.mov              # Extract audio (creates video-audio.mp3)
 
 PRESETS:
@@ -79,20 +79,17 @@ class Config:
     codec: str = "h264"
     format: str = "mp4"  # Default format for video output
     use_gpu: bool = False
-    trash_backups: bool = False
+    trash_originals: bool = False
     dry_run: bool = False
     interactive: bool = False
     audio_file: Optional[Path] = None
     log: bool = False
+    automator: bool = False  # macOS Automator mode: notify errors, exit 0
 
 # Global constants
 DEFAULT_CODEC = "h264"
 DEFAULT_FORMAT = "mp4"
 ORIGINAL_PREFIX = "~"
-VIDEO_METADATA_KEY = "comment"  # Standard metadata field for all video formats
-IMAGE_METADATA_KEY = "description"
-IMAGE_METADATA_PREFIX = "automat:"
-METADATA_VERSION = 1
 
 # Global runtime state (set by main())
 _GLOBAL_CONFIG: Optional['Config'] = None
@@ -170,9 +167,9 @@ class MediaFile:
         """Check if file is an image"""
         return self.mime_type.startswith("image/")
 
-    def is_already_processed(self, signature: dict) -> bool:
-        """Check if file was already processed by metadata signature"""
-        return is_already_processed(self.path, signature)
+    def is_already_processed(self, operation: str, config: 'Config') -> bool:
+        """Check if file was already processed by checking output file existence"""
+        return is_already_processed(self.path, operation, config)
 
     def get_video_info(self) -> VideoInfo:
         """Get cached video metadata from ffprobe"""
@@ -229,9 +226,23 @@ def setup_logging(log_path=None, debug=False):
         logger.addHandler(file_handler)
 
 def notify(title, message):
-    """Show a macOS notification"""
+    """Show a macOS notification (no-op on other platforms)"""
+    if sys.platform != "darwin":
+        return
     script = f'display notification "{message}" with title "{title}"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
+
+def exit_with_error(message: str, code: int = 1):
+    """
+    Exit with error. In automator mode on macOS, show notification and exit 0.
+    On Linux or non-automator mode, print to stderr and exit with code.
+    """
+    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.automator and sys.platform == "darwin":
+        notify("Automat Error", message)
+        sys.exit(0)
+    else:
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(code)
 
 def display_error(message):
     logger.error(message)
@@ -265,45 +276,25 @@ def _base_name(path: Path) -> str:
 
 def make_temp_output_path(src: Path, ext: str) -> Path:
     """
-    Generate a unique temporary output path using session code.
-    If session code is not set, falls back to random token.
-    Uses exclusive file creation to prevent race conditions.
+    Generate a temporary output path with -tmp suffix.
+    If collision, appends a short random token.
     """
     ext = _normalize_ext(ext)
+    base = _base_name(src)
 
-    # Use session code if available, otherwise generate random token
-    if _SESSION_CODE:
-        candidate = src.parent / f"{_base_name(src)}-automat-{_SESSION_CODE}.{ext}"
-        # Check if this path is already taken (shouldn't happen in normal flow)
-        if not candidate.exists():
-            return candidate
-        # Fallback: append additional random suffix if collision
-        token = secrets.token_hex(2)
-        candidate = src.parent / f"{_base_name(src)}-automat-{_SESSION_CODE}-{token}.{ext}"
+    # First try simple -tmp suffix
+    candidate = src.parent / f"{base}-tmp.{ext}"
+    if not candidate.exists():
         return candidate
 
-    # Fallback for when session code not set (shouldn't happen)
-    max_attempts = 100
-    for attempt in range(max_attempts):
-        token = secrets.token_hex(4)
-        candidate = src.parent / f"{_base_name(src)}-automat-{token}.{ext}"
-        try:
-            # Try to create an empty marker file with O_EXCL to ensure atomicity
-            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.close(fd)
-            # Immediately remove it - we just wanted to reserve the name
-            candidate.unlink()
+    # If collision, add short random token
+    for _ in range(100):
+        token = secrets.token_hex(2)
+        candidate = src.parent / f"{base}-tmp-{token}.{ext}"
+        if not candidate.exists():
             return candidate
-        except FileExistsError:
-            # Collision - try again with new token
-            continue
-        except Exception as e:
-            # Other error - just check existence as fallback
-            display_debug(f"Warning: atomic create failed ({e}), falling back to exists check")
-            if not candidate.exists():
-                return candidate
-    # Should never happen with 100 attempts and random hex tokens
-    raise RuntimeError(f"Failed to generate unique temp path after {max_attempts} attempts")
+
+    raise RuntimeError("Failed to generate unique temp path")
 
 def final_output_path(src: Path, ext: str, suffix: str = "") -> Path:
     """
@@ -366,374 +357,58 @@ def describe_file(path: Path) -> dict:
         info["mtime"] = None
     return info
 
-def build_run_signature(config: Config, operation: str, encoding_params: Optional[dict] = None) -> dict:
-    """
-    Build signature for this processing run.
 
-    Args:
-        config: Runtime configuration
-        operation: The operation being performed (refine, amv, etc)
-        encoding_params: Optional dict with actual encoding parameters:
-            - crf: CRF value for CPU encoding
-            - bitrate: Bitrate for GPU encoding
-            - resolution: Output resolution (width, height)
-            - audio_bitrate: Audio bitrate string
-            - audio_codec: Audio codec string
+def is_already_processed(path: Path, operation: str, config: Config) -> bool:
     """
-    signature = {
-        "version": METADATA_VERSION,
-        "operation": operation,
-        "codec": config.codec,
-        "format": _normalize_ext(config.format),
-        "use_gpu": config.use_gpu,
-        "preset": config.preset.name,
+    Check if file has already been processed by checking if output file exists.
+
+    For suffix-based operations, checks if the output file with the appropriate
+    suffix already exists. This replaces the old metadata-based checking.
+    """
+    path = Path(path)
+
+    # Map operations to their output suffixes
+    suffix_map = {
+        "refine": "-re",
+        "amv": "-amv",
+        "audiofy": "-audio",
+        "loop_audio": "-loop",
     }
 
-    # Add actual encoding parameters if provided (for refine operation)
-    if encoding_params:
-        if encoding_params.get("crf") is not None:
-            signature["crf"] = encoding_params["crf"]
-        if encoding_params.get("bitrate") is not None:
-            signature["bitrate"] = encoding_params["bitrate"]
-        if encoding_params.get("resolution"):
-            signature["resolution"] = encoding_params["resolution"]
-        if encoding_params.get("audio_bitrate"):
-            signature["audio_bitrate"] = encoding_params["audio_bitrate"]
-        if encoding_params.get("audio_codec"):
-            signature["audio_codec"] = encoding_params["audio_codec"]
-
-    # Only include audio file hash for amv/audiofy operations (not needed for refine)
-    if operation in {"amv", "audiofy"} and config.audio_file:
-        signature["audio"] = describe_file(config.audio_file)
-
-    return signature
-
-def metadata_payload(metadata: dict) -> str:
-    return json.dumps(metadata, separators=(",", ":"), sort_keys=True)
-
-def _run_readonly(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-def validate_signature(signature: Any) -> bool:
-    """Validate that signature has all required fields"""
-    if not isinstance(signature, dict):
+    suffix = suffix_map.get(operation)
+    if not suffix:
+        # Operations without suffix (like portrait) - don't skip
         return False
-    required_fields = {"version", "operation", "codec", "format", "use_gpu", "preset"}
-    return required_fields.issubset(signature.keys())
 
-class MetadataBackend:
-    """Unified metadata read/write backend for embedded metadata in media files"""
-
-    def __init__(self, config: Optional[Config] = None):
-        self.config = config or _GLOBAL_CONFIG
-
-    def read(self, path: Path) -> Optional[Dict[str, Any]]:
-        """Read metadata from file, validating structure"""
-        if is_video_file(path) or is_audio_file(path):
-            meta = self._read_video_metadata(path)
-        elif is_image_file(path):
-            meta = self._read_image_metadata(path)
-        else:
-            return None
-
-        # Validate metadata structure
-        if meta and isinstance(meta, dict):
-            # Check that signature is valid
-            if "signature" in meta and validate_signature(meta["signature"]):
-                return meta
-        return None
-
-    def write(self, path: Path, metadata: Dict[str, Any]) -> bool:
-        """Write metadata to file"""
-        if self.config and self.config.dry_run:
-            display_info(f"[DRY RUN] Would write metadata to: {path}")
-            return True
-
-        # Only images need explicit metadata write (videos get it via ffmpeg)
-        if not is_image_file(path):
-            display_error(f"Metadata write unsupported for non-image: {path}")
-            return False
-
-        try:
-            payload = metadata_payload(metadata)
-        except (TypeError, ValueError) as e:
-            display_error(f"Failed to serialize metadata for {path}: {e}")
-            return False
-
-        value = f"{IMAGE_METADATA_PREFIX}{payload}"
-        cmd = ["sips", "-s", IMAGE_METADATA_KEY, value, str(path)]
-        res = _run_readonly(cmd)
-        if res.returncode != 0:
-            display_error(f"Failed to write metadata to {path}: {res.stderr.strip()}")
-            return False
-        return True
-
-    def _read_video_metadata(self, path: Path) -> Optional[Dict[str, Any]]:
-        """Read metadata from video/audio file using standard 'comment' field"""
-        cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_entries", "format_tags", str(path)]
-        res = _run_readonly(cmd)
-        if res.returncode != 0 or not res.stdout.strip():
-            return None
-        try:
-            info = json.loads(res.stdout)
-        except json.JSONDecodeError:
-            return None
-        tags = info.get("format", {}).get("tags", {}) or {}
-        if not isinstance(tags, dict):
-            return None
-
-        # Case-insensitive search for the comment field
-        for key, value in tags.items():
-            if isinstance(key, str) and key.lower() == VIDEO_METADATA_KEY.lower():
-                if not value:
-                    return None
-                try:
-                    return json.loads(value)
-                except json.JSONDecodeError:
-                    return None
-        return None
-
-    def _read_image_metadata(self, path: Path) -> Optional[Dict[str, Any]]:
-        """Read metadata from image file with case-insensitive key search"""
-        cmd = ["sips", "-g", IMAGE_METADATA_KEY, "-1", str(path)]
-        res = _run_readonly(cmd)
-        if res.returncode != 0 or not res.stdout.strip():
-            return None
-        value = None
-        for line in res.stdout.splitlines():
-            line = line.strip()
-            # Case-insensitive search for the key
-            if ":" in line:
-                line_key, line_value = line.split(":", 1)
-                if line_key.strip().lower() == IMAGE_METADATA_KEY.lower():
-                    value = line_value.strip()
-                    break
-        if not value or value in {"(null)", "null"}:
-            return None
-        if not value.startswith(IMAGE_METADATA_PREFIX):
-            return None
-        raw = value[len(IMAGE_METADATA_PREFIX):]
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-
-def insert_ffmpeg_metadata(cmd: list[str], metadata: dict) -> list[str]:
-    """
-    Insert metadata into ffmpeg command.
-    Metadata must be placed before -y flag but after all other encoding options.
-    Uses standard 'comment' field for all formats.
-    """
-    payload = metadata_payload(metadata)
-
-    # Find the position of -y flag
-    try:
-        y_index = cmd.index("-y")
-        # Insert metadata before -y
-        return cmd[:y_index] + ["-metadata", f"{VIDEO_METADATA_KEY}={payload}"] + cmd[y_index:]
-    except ValueError:
-        # No -y flag found, append before output file (last argument)
-        return cmd[:-1] + ["-metadata", f"{VIDEO_METADATA_KEY}={payload}"] + [cmd[-1]]
-
-# Legacy wrapper functions (for backward compatibility)
-def read_video_metadata(path: Path) -> Optional[dict]:
-    """Legacy wrapper - use MetadataBackend.read() instead"""
-    backend = MetadataBackend()
-    return backend._read_video_metadata(path)
-
-def read_image_metadata(path: Path) -> Optional[dict]:
-    """Legacy wrapper - use MetadataBackend.read() instead"""
-    backend = MetadataBackend()
-    return backend._read_image_metadata(path)
-
-def read_processing_metadata(path: Path) -> Optional[dict]:
-    """Legacy wrapper - use MetadataBackend.read() instead"""
-    backend = MetadataBackend()
-    return backend.read(path)
-
-def write_processing_metadata(path: Path, metadata: dict) -> bool:
-    """Legacy wrapper - use MetadataBackend.write() instead"""
-    backend = MetadataBackend()
-    return backend.write(path, metadata)
-
-def is_already_processed(path: Path, signature: dict) -> bool:
-    meta = read_processing_metadata(path)
-    if not meta or not isinstance(meta, dict):
-        return False
-    return meta.get("signature") == signature
-
-def check_file_status(path: Path, config: Config, operation: str) -> dict:
-    """
-    Check processing status of a file.
-    Returns dict with:
-      - processed: bool - whether file has automat metadata
-      - metadata: dict | None - full metadata if present
-      - will_reprocess: bool - whether file would be processed again with current config
-      - reason: str - explanation
-
-    For refine operation, calculates what encoding parameters WOULD be used
-    and compares them to stored signature for accurate reprocess detection.
-    """
-    backend = MetadataBackend(config)
-    meta = backend.read(path)
-
-    if not meta:
-        return {
-            "processed": False,
-            "metadata": None,
-            "will_reprocess": True,
-            "reason": "No automat metadata found - file will be processed"
-        }
-
-    signature = meta.get("signature", {})
-
-    # For refine operation, calculate what encoding params would be used
-    if operation == "refine" and (is_video_file(path) or is_audio_file(path)):
-        try:
-            media = MediaFile(path)
-            video_info = media.get_video_info()
-            w, h = video_info.width, video_info.height
-            br = video_info.bitrate
-
-            is_hd = max(w, h) > 1080
-            low_bitrate_thresh = 2_500_000 if is_hd else 1_200_000
-            gpu_bitrate_thresh = 4_000_000 if is_hd else 2_500_000
-            min_gpu_bitrate = 600_000 if is_hd else 450_000
-
-            is_cpu = not config.use_gpu
-            crf_value = None
-            dynamic_bitrate = None
-
-            if is_cpu:
-                if config.codec == "h264":
-                    crf_value = 28 if (br > 0 and br < low_bitrate_thresh) else 24
-                elif config.codec == "hevc":
-                    crf_value = 32 if (br > 0 and br < low_bitrate_thresh) else 28
-            else:
-                src_bitrate = br if br > 0 else gpu_bitrate_thresh
-                if src_bitrate < 1_000_000:
-                    dynamic_bitrate = max(int(src_bitrate * 0.85), min_gpu_bitrate)
-                else:
-                    if src_bitrate > gpu_bitrate_thresh:
-                        chosen = int(max(0.8 * src_bitrate, gpu_bitrate_thresh))
-                        dynamic_bitrate = min(src_bitrate, chosen)
-                    else:
-                        dynamic_bitrate = src_bitrate
-                    if dynamic_bitrate < min_gpu_bitrate:
-                        dynamic_bitrate = min_gpu_bitrate
-
-            encoding_params = {
-                "crf": crf_value,
-                "bitrate": dynamic_bitrate,
-                "resolution": (w, h),
-                "audio_bitrate": "96k",
-                "audio_codec": "aac",
-            }
-            current_signature = build_run_signature(config, operation, encoding_params)
-        except Exception:
-            # If we can't get video info, fall back to basic signature
-            current_signature = build_run_signature(config, operation)
+    # Determine output extension based on operation
+    if operation == "audiofy" and is_video_file(path):
+        # Audiofy extracts to mp3
+        ext = "mp3"
+    elif operation == "refine" and is_image_file(path):
+        # Image refine outputs to heic
+        ext = "heic"
     else:
-        current_signature = build_run_signature(config, operation)
+        ext = config.format
 
-    if signature == current_signature:
-        return {
-            "processed": True,
-            "metadata": meta,
-            "will_reprocess": False,
-            "reason": "Already processed with identical settings - will be skipped"
-        }
-
-    # Build detailed reason for reprocessing with all relevant fields
-    diffs = []
-    all_keys = set(signature.keys()) | set(current_signature.keys())
-    # Order keys logically
-    key_order = ["operation", "codec", "format", "use_gpu", "preset", "crf", "bitrate", "resolution", "audio_bitrate", "audio_codec"]
-    for key in key_order:
-        if key in all_keys and key != "version":
-            old_val = signature.get(key)
-            new_val = current_signature.get(key)
-            if old_val != new_val:
-                # Format values nicely
-                if key == "bitrate" and new_val is not None:
-                    new_val_str = f"{new_val // 1000}k" if isinstance(new_val, int) else str(new_val)
-                    old_val_str = f"{old_val // 1000}k" if isinstance(old_val, int) and old_val is not None else str(old_val)
-                    diffs.append(f"{key}: {old_val_str} → {new_val_str}")
-                elif key == "resolution":
-                    old_val_str = f"{old_val[0]}x{old_val[1]}" if old_val else "None"
-                    new_val_str = f"{new_val[0]}x{new_val[1]}" if new_val else "None"
-                    diffs.append(f"{key}: {old_val_str} → {new_val_str}")
-                else:
-                    diffs.append(f"{key}: {old_val} → {new_val}")
-
-    if not diffs:
-        reason = "Settings appear unchanged but signature mismatch detected"
-    else:
-        reason = "Settings changed - file will be reprocessed:\n  " + "\n  ".join(diffs)
-
-    return {
-        "processed": True,
-        "metadata": meta,
-        "will_reprocess": True,
-        "reason": reason
-    }
-
-def ensure_metadata_present(path: Path, signature: Optional[dict]) -> bool:
-    """
-    Verify that metadata is present and matches signature.
-    Graceful degradation: if metadata can't be read, log warning but don't fail.
-
-    Note: Files without readable metadata will NOT be skipped on subsequent runs,
-    as the system won't be able to detect they've already been processed.
-    """
-    if not signature:
-        display_error(f"Missing signature for metadata verification: {path}")
-        return False
-
-    backend = MetadataBackend()
-    meta = backend.read(path)
-
-    if not meta:
-        # Graceful degradation: metadata might not be supported for this format
-        # Upgrade to warning level so user is aware of the limitation
-        display_warning(
-            f"Could not read metadata from {path}. "
-            f"File will be reprocessed on next run (doneness tracking unavailable)."
-        )
-        return True
-
-    if meta.get("signature") != signature:
-        display_error(f"Processed metadata mismatched (expected signature not found): {path}")
-        return False
-
-    return True
+    output_path = final_output_path(path, ext, suffix=suffix)
+    return output_path.exists()
 
 def finalize_processed_output(
     src: Path,
     temp_out: Path,
     final_out: Path,
     config: Config,
-    metadata: dict,
     rename_original: bool = False,
 ) -> bool:
     """
     Finalize processed output with atomic operations and full rollback on failure.
 
     Behavior:
-      - If rename_original=True (REFINE):
-        1. Verify metadata in temp_out
-        2. Rename src -> ~src (prefixed backup)
-        3. Move temp_out -> final_out (replaces src)
-        4. Optionally trash ~src if --trash-backups
-
-      - If rename_original=False (AMV/AUDIOFY/LOOP/etc):
-        1. Verify metadata in temp_out
-        2. Move temp_out -> final_out (new file with suffix)
-        3. Keep src completely untouched
+      1. Move temp_out -> final_out (new file with suffix like -re, -amv, etc.)
+      2. Optionally trash original src if --trash-originals is set
 
     Args:
-        rename_original: If True, rename source to ~source (for refine operation).
-                        If False (default), keep original untouched (for amv/portrait/audiofy operations).
+        rename_original: Legacy parameter, no longer used (kept for compatibility).
     """
     prefixed_src = prefixed_original_path(src) if rename_original else None
 
@@ -744,10 +419,6 @@ def finalize_processed_output(
             display_info(f"[DRY RUN] Would finalize: {temp_out} -> {final_out} (keeping {src} untouched)")
         unregister_temp_output(temp_out)
         return True
-
-    if not ensure_metadata_present(temp_out, metadata.get("signature")):
-        cleanup_temp_output(temp_out)
-        return False
 
     # Track state for rollback
     src_was_renamed = False
@@ -792,7 +463,12 @@ def finalize_processed_output(
             safe_unlink(final_out_backup, label="backup file")
 
     except Exception as e:
-        display_error(f"Finalize failed for {src}: {e}")
+        error_msg = str(e)
+        display_error(f"Finalize failed for {src}: {error_msg}")
+
+        # Show macOS notification for permission errors (avoids Automator modal popup)
+        if "Permission denied" in error_msg or "Operation not permitted" in error_msg:
+            notify("Automat Error", f"Permission denied: {src.name}. Grant Full Disk Access in System Settings.")
 
         # Rollback: restore original state
         # 1. Restore final_out from backup
@@ -816,37 +492,14 @@ def finalize_processed_output(
     finally:
         unregister_temp_output(temp_out)
 
-    # Move backup to trash if requested (only for refine operation)
-    if config.trash_backups and rename_original and prefixed_src:
-        # Trash the prefixed backup (~src)
-        move_to_trash(prefixed_src)
+    # Trash original if requested
+    if config.trash_originals:
+        move_to_trash(src)
     return True
 
 def cleanup_temp_output(temp_out: Path):
     unregister_temp_output(temp_out)
     safe_unlink(temp_out, label="temp output")
-
-def mark_original_processed(src: Path, config: Config, metadata: dict) -> bool:
-    prefixed_src = prefixed_original_path(src)
-    if config.dry_run:
-        display_info(f"[DRY RUN] Would mark processed: {src} -> {prefixed_src}")
-        return True
-    try:
-        if prefixed_src != src:
-            src.replace(prefixed_src)
-    except Exception as e:
-        display_error(f"Failed to rename original {src}: {e}")
-        return False
-    if not write_processing_metadata(prefixed_src, metadata):
-        try:
-            if prefixed_src != src and not src.exists():
-                prefixed_src.replace(src)
-        except Exception as restore_error:
-            logger.warning(f"Failed to restore original: {prefixed_src} -> {src} ({restore_error})")
-        return False
-    if config.trash_backups:
-        move_to_trash(prefixed_src)
-    return True
 
 def is_video_file(path) -> bool:
     path = Path(path)
@@ -899,6 +552,11 @@ def move_to_trash(path):
     if not path.exists():
         logger.error("File not found for trashing: %s", path)
         return
+
+    if sys.platform != "darwin":
+        display_warning(f"Trash not supported on this platform, skipping: {path}")
+        return
+
     script = f'''
     tell application "Finder"
         move POSIX file "{path.as_posix()}" to trash
@@ -1160,10 +818,10 @@ class Operation(ABC):
 
     def _cleanup_source(self, media: MediaFile, config: Config):
         """Common cleanup logic - move to trash if requested"""
-        if config.trash_backups and not config.dry_run:
+        if config.trash_originals and not config.dry_run:
             move_to_trash(media.path)
 
-def process_video_refine(src, config: Config, signature: dict):
+def process_video_refine(src, config: Config):
     """
     Refine a video file by re-encoding it
     - For CPU: dynamically choose CRF based on source bitrate and resolution.
@@ -1228,42 +886,13 @@ def process_video_refine(src, config: Config, signature: dict):
     # For AMV and loop_audio, behavior is unchanged (handled outside)
     # For refine: pass new crf_value/dynamic_bitrate
     temp_out = make_temp_output_path(src, config.format)
-    final_out = final_output_path(src, config.format)
+    final_out = final_output_path(src, config.format, suffix="-re")
     register_temp_output(temp_out)
 
-    # Build enriched signature with actual encoding parameters
-    encoding_params = {
-        "crf": crf_value,
-        "bitrate": dynamic_bitrate,
-        "resolution": (w, h),
-        "audio_bitrate": "96k",
-        "audio_codec": "aac",
-    }
-    enriched_signature = build_run_signature(config, "refine", encoding_params)
-
-    details = {
-        "input": {
-            "width": w,
-            "height": h,
-            "duration": dur,
-            "bitrate": br,
-            "filesize": sz,
-        },
-        "encoding": {
-            "codec": config.codec,
-            "format": config.format,
-            "mode": "cpu" if is_cpu else "gpu",
-            "crf": crf_value,
-            "bitrate": dynamic_bitrate,
-            "audio_bitrate": "96k",
-        },
-    }
-    metadata = {"signature": enriched_signature, "details": details}
     cmd, _ = build_ffmpeg_command(
         src, config.codec, config.format, temp_out,
         is_cpu=is_cpu, crf_value=crf_value, dynamic_bitrate=dynamic_bitrate
     )
-    cmd = insert_ffmpeg_metadata(cmd, metadata)
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
     if res.returncode != 0 and not config.dry_run:
@@ -1278,9 +907,11 @@ def process_video_refine(src, config: Config, signature: dict):
     new_sz = temp_out.stat().st_size if not config.dry_run else int(orig_sz * 0.7)  # Estimate for dry run
     red = (1 - new_sz / orig_sz) * 100 if orig_sz > 0 else 0
     display_info(f"{orig_sz/1e6:.2f}→{new_sz/1e6:.2f} MB ({red:.1f}% reduction)")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata, rename_original=True)
+    # Don't rename original - just create the -re output alongside it
+    # This avoids permission issues with Automator
+    return finalize_processed_output(src, temp_out, final_out, config, rename_original=False)
 
-def process_video_amv(src, audio_track, config: Config, signature: dict):
+def process_video_amv(src, audio_track, config: Config):
     """Add or replace audio track in video (AMV operation)"""
     src = Path(src)
     audio_track = Path(audio_track)
@@ -1292,17 +923,6 @@ def process_video_amv(src, audio_track, config: Config, signature: dict):
         display_error(f"Audio track not found: {audio_track}")
         cleanup_temp_output(temp_out)
         return False
-
-    details = {
-        "audio_source": describe_file(audio_track),
-        "encoding": {
-            "video": "copy",
-            "audio_codec": "aac",
-            "audio_bitrate": "128k",
-            "format": config.format,
-        },
-    }
-    metadata = {"signature": signature, "details": details}
 
     # Build FFmpeg command for AMV operation
     cmd = ["ffmpeg"]
@@ -1322,7 +942,6 @@ def process_video_amv(src, audio_track, config: Config, signature: dict):
         "-y",
         str(temp_out)
     ]
-    cmd = insert_ffmpeg_metadata(cmd, metadata)
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
@@ -1336,9 +955,9 @@ def process_video_amv(src, audio_track, config: Config, signature: dict):
         return False
 
     display_info(f"AMV created: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata)
+    return finalize_processed_output(src, temp_out, final_out, config)
 
-def process_video_loop_audio(src, config: Config, signature: dict):
+def process_video_loop_audio(src, config: Config):
     """Loop audio to match video duration"""
     src = Path(src)
     temp_out = make_temp_output_path(src, config.format)
@@ -1365,17 +984,6 @@ def process_video_loop_audio(src, config: Config, signature: dict):
 
     video_duration = float(video_stream.get("duration", 0) or info.get("format",{}).get("duration", 0))
 
-    details = {
-        "encoding": {
-            "video": "copy",
-            "audio_codec": "aac",
-            "audio_bitrate": "128k",
-            "duration": video_duration,
-            "format": config.format,
-        },
-    }
-    metadata = {"signature": signature, "details": details}
-
     # Build FFmpeg command to loop audio
     cmd = ["ffmpeg"]
     if config.use_gpu:
@@ -1392,7 +1000,6 @@ def process_video_loop_audio(src, config: Config, signature: dict):
         "-y",
         str(temp_out)
     ]
-    cmd = insert_ffmpeg_metadata(cmd, metadata)
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
@@ -1406,26 +1013,16 @@ def process_video_loop_audio(src, config: Config, signature: dict):
         return False
 
     display_info(f"Audio looped: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata)
+    return finalize_processed_output(src, temp_out, final_out, config)
 
-def process_video_audiofy(src, config: Config, signature: dict):
+def process_video_audiofy(src, config: Config):
     """Extract audio from video and save as audio file"""
     src = Path(src)
     temp_out = make_temp_output_path(src, "mp3")
     final_out = final_output_path(src, "mp3", suffix="-audio")
     register_temp_output(temp_out)
 
-    details = {
-        "encoding": {
-            "audio_codec": "libmp3lame",
-            "audio_bitrate": "192k",
-            "format": "mp3",
-        },
-    }
-    metadata = {"signature": signature, "details": details}
-
     cmd = ["ffmpeg", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(temp_out)]
-    cmd = insert_ffmpeg_metadata(cmd, metadata)
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
@@ -1439,19 +1036,14 @@ def process_video_audiofy(src, config: Config, signature: dict):
         return False
 
     display_info(f"Audio extracted: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata)
+    return finalize_processed_output(src, temp_out, final_out, config)
 
-def process_image(src, config: Config, signature: dict):
+def process_image(src, config: Config):
     src = Path(src)
     temp_out = make_temp_output_path(src, "heic")
-    final_out = final_output_path(src, "heic")
+    final_out = final_output_path(src, "heic", suffix="-re")
     register_temp_output(temp_out)
-    details = {
-        "encoding": {
-            "format": "heic",
-        },
-    }
-    metadata = {"signature": signature, "details": details}
+
     cmd = ["sips","-s","format","heic",str(src),"--out",str(temp_out)]
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
@@ -1463,16 +1055,14 @@ def process_image(src, config: Config, signature: dict):
         display_error(f"Output missing: {temp_out}")
         cleanup_temp_output(temp_out)
         return False
-    if not write_processing_metadata(temp_out, metadata):
-        cleanup_temp_output(temp_out)
-        return False
     orig_sz = src.stat().st_size
     new_sz = temp_out.stat().st_size if not config.dry_run else int(orig_sz * 0.5)  # Estimate for dry run
     red = (1-new_sz/orig_sz)*100 if orig_sz>0 else 0
     display_info(f"{orig_sz/1e3:.2f}→{new_sz/1e3:.2f} KB ({red:.1f}% reduction)")
-    return finalize_processed_output(src, temp_out, final_out, config, metadata, rename_original=True)
+    # Don't rename original - just create the -re output alongside it
+    return finalize_processed_output(src, temp_out, final_out, config, rename_original=False)
 
-def process_portrait(src, config: Config, signature: dict):
+def process_portrait(src, config: Config):
     """Generate Baldur's Gate portrait sizes as 24-bit BMPs."""
     src = Path(src)
     portraits_dir = src.parent / "Portraits"
@@ -1558,7 +1148,7 @@ def process_portrait(src, config: Config, signature: dict):
         return True
     return False
 
-def process_single_file(file_path, operation, config: Config, signature: dict):
+def process_single_file(file_path, operation, config: Config):
     """Process a single file with the specified operation"""
     file_path = Path(file_path)
 
@@ -1575,32 +1165,32 @@ def process_single_file(file_path, operation, config: Config, signature: dict):
     if is_video_file(file_path):
         display_info(f"Processing video: {file_path}")
         if operation == "refine":
-            if not process_video_refine(file_path, config, signature):
+            if not process_video_refine(file_path, config):
                 success = False
         elif operation == "amv":
             if not config.audio_file:
                 display_error("AMV operation requires audio track (-a parameter)")
                 success = False
-            elif not process_video_amv(file_path, config.audio_file, config, signature):
+            elif not process_video_amv(file_path, config.audio_file, config):
                 success = False
         elif operation == "loop_audio":
-            if not process_video_loop_audio(file_path, config, signature):
+            if not process_video_loop_audio(file_path, config):
                 success = False
         elif operation == "audiofy":
-            if not process_video_audiofy(file_path, config, signature):
+            if not process_video_audiofy(file_path, config):
                 success = False
         elif operation == "portrait":
             display_info(f"Skipping portrait for video: {file_path}")
     elif is_image_file(file_path):
         display_info(f"Processing image: {file_path}")
         if operation == "refine":
-            if not process_image(file_path, config, signature):
+            if not process_image(file_path, config):
                 success = False
         elif operation == "portrait":
-            if not process_portrait(file_path, config, signature):
+            if not process_portrait(file_path, config):
                 success = False
         elif operation == "audiofy" and config.audio_file:
-            if not process_image_audiofy(file_path, config.audio_file, config, signature):
+            if not process_image_audiofy(file_path, config.audio_file, config):
                 success = False
         else:
             if operation not in ("refine", "audiofy", "portrait"):
@@ -1609,7 +1199,7 @@ def process_single_file(file_path, operation, config: Config, signature: dict):
         display_error(f"Unsupported file type: {file_path}")
         success = False
     return success
-def process_image_audiofy(src, audio_track, config: Config, signature: dict):
+def process_image_audiofy(src, audio_track, config: Config):
     """
     Given an image and an audio track, create a video of the image with the audio.
     If audio_track is a video, extract its audio stream first.
@@ -1650,17 +1240,6 @@ def process_image_audiofy(src, audio_track, config: Config, signature: dict):
         temp_out = make_temp_output_path(src, config.format)
         final_out = final_output_path(src, config.format, suffix="-amv")
         register_temp_output(temp_out)
-        details = {
-            "audio_source": describe_file(audio_track),
-            "encoding": {
-                "video_codec": config.codec,
-                "audio_codec": "aac",
-                "audio_bitrate": "192k",
-                "duration": duration,
-                "format": config.format,
-            },
-        }
-        metadata = {"signature": signature, "details": details}
 
         # Build ffmpeg command to create video from image + audio
         # Use -loop 1 to repeat image, -framerate 30, -t for duration, -shortest for audio, -r 30 before output
@@ -1681,7 +1260,6 @@ def process_image_audiofy(src, audio_track, config: Config, signature: dict):
             "-y",
             str(temp_out)
         ]
-        cmd = insert_ffmpeg_metadata(cmd, metadata)
         logger.info("Running: " + " ".join(str(x) for x in cmd))
         res = run_command(cmd)
         if res.returncode != 0 and not config.dry_run:
@@ -1693,7 +1271,7 @@ def process_image_audiofy(src, audio_track, config: Config, signature: dict):
             cleanup_temp_output(temp_out)
             return False
         display_info(f"Created video from image and audio: {temp_out}")
-        return finalize_processed_output(src, temp_out, final_out, config, metadata)
+        return finalize_processed_output(src, temp_out, final_out, config)
     finally:
         # Clean up temp audio file if it was created
         if tmp_audio is not None and Path(tmp_audio).exists():
@@ -1701,6 +1279,17 @@ def process_image_audiofy(src, audio_track, config: Config, signature: dict):
                 Path(tmp_audio).unlink()
             except Exception as e:
                 logger.warning(f"Failed to clean up temp audio file: {tmp_audio} ({e})")
+
+# Suffixes that indicate a file was already processed
+PROCESSED_SUFFIXES = ("-re", "-amv", "-audio", "-loop", "-tmp")
+
+def _is_processed_file(path: Path) -> bool:
+    """Check if file has a suffix indicating it was already processed."""
+    stem = path.stem
+    for suffix in PROCESSED_SUFFIXES:
+        if stem.endswith(suffix):
+            return True
+    return False
 
 def expand_paths_recursively(paths):
     """Recursively expand all given paths into a flat list of media files"""
@@ -1726,16 +1315,20 @@ def expand_paths_recursively(paths):
             path = Path(os.getcwd()) / path
 
         if path.is_file():
-            # Single file - add if it's a media file (include already-processed too)
+            # Single file - add if it's a media file and not already processed
             if path.name.startswith(ORIGINAL_PREFIX):
+                continue
+            if _is_processed_file(path):
                 continue
             if is_video_file(path) or is_image_file(path):
                 expanded_files.append(path)
         elif path.is_dir():
-            # Directory - recursively find all media files (include already-processed too)
+            # Directory - recursively find all media files (skip already-processed)
             for file_path in path.rglob("*"):
                 if file_path.is_file():
                     if file_path.name.startswith(ORIGINAL_PREFIX):
+                        continue
+                    if _is_processed_file(file_path):
                         continue
                     if is_video_file(file_path) or is_image_file(file_path):
                         expanded_files.append(file_path)
@@ -1790,13 +1383,13 @@ def refine_recursively(directory, codec, fmt):
         codec=codec,
         format=fmt,
         use_gpu=False,
-        trash=False,
+        trash_originals=False,
         dry_run=False,
         interactive=False,
         audio_file=None,
         log=False,
+        automator=False,
     )
-    signature = build_run_signature(config, "refine")
 
     # Set up progress tracking (legacy function - uses old format)
     base_path = get_base_path([directory])
@@ -1818,13 +1411,13 @@ def refine_recursively(directory, codec, fmt):
     for path in files:
         n = proc + skipped + fail + 1
         print(f"{n}/{total}: {path}", flush=True)
-        if is_already_processed(path, signature):
+        if is_already_processed(path, "refine", config):
             print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {path}", file=sys.stderr, flush=True)
             skipped += 1
             continue
 
         display_info(f"[{n}/{total}] Processing: {path}")
-        if process_single_file(path, "refine", config, signature):
+        if process_single_file(path, "refine", config):
             proc += 1
         else:
             print(f"{color_tag('[Failed]', COLOR_RED)} {path}", file=sys.stderr, flush=True)
@@ -1926,14 +1519,14 @@ class InteractiveMode:
             if codec_choice in ["h264", "hevc", "av1"]:
                 config.codec = codec_choice
 
-            trash_choice = input("Move backup files (~originals) to trash? [y/N]: ").strip().lower()
-            config.trash_backups = trash_choice == "y"
+            trash_choice = input("Move original files to trash after processing? [y/N]: ").strip().lower()
+            config.trash_originals = trash_choice == "y"
 
         print(f"\nReady to process {len(files)} file(s)")
         print(f"Operations: {', '.join(operations)}")
         print(f"Codec: {config.codec}")
         print(f"Preset: {config.preset.name}")
-        print(f"Trash backups: {'Yes' if config.trash_backups else 'No'}")
+        print(f"Trash originals: {'Yes' if config.trash_originals else 'No'}")
         print()
         confirm = input("Proceed? [Y/n]: ").strip().lower()
         if confirm == "n":
@@ -2159,7 +1752,7 @@ def main():
             "     - Script:\n"
             "```\n"
             "source $HOME/.zprofile\n"
-            "automat.py -t \"$@\"\n"
+            "automat.py --automator -t \"$@\"\n"
             "```\n"
         )
     )
@@ -2193,18 +1786,18 @@ def main():
                    help="Audio file for AMV/audiofy operations")
     p.add_argument("-c", "--codec", choices=["h264", "hevc", "av1"], default="h264",
                    help="Video codec: h264 (most compatible, default), hevc (better compression), av1 (experimental)")
-    p.add_argument("-s", "--suffix", default="-re",
-                   help="Legacy suffix option (ignored) [default: -re]")
 
     # Behavior flags
     p.add_argument("--use-gpu", action="store_true",
                    help="Use hardware acceleration (videotoolbox) for faster encoding")
-    p.add_argument("-t", "--trash-backups", action="store_true",
-                   help="Move backup files (~originals) to trash after processing (refine only)")
+    p.add_argument("-t", "--trash-originals", action="store_true",
+                   help="Move original files to trash after successful processing")
     p.add_argument("--log", action="store_true",
                    help="Enable detailed logging to file")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="Dry-run mode (show what would happen without processing)")
+    p.add_argument("--automator", action="store_true",
+                   help="Automator mode: show notifications for errors and exit 0 (macOS only)")
 
     # File arguments
     p.add_argument("files", nargs="+",
@@ -2223,11 +1816,12 @@ def main():
         codec=args.codec,
         format=DEFAULT_FORMAT,  # Always use mp4 for videos
         use_gpu=args.use_gpu,
-        trash_backups=args.trash_backups,
+        trash_originals=args.trash_originals,
         dry_run=args.dry_run,
         interactive=args.interactive,
         audio_file=Path(args.audio) if args.audio else None,
         log=args.log,
+        automator=args.automator,
     )
 
     # Set global config for functions that need it
@@ -2274,8 +1868,7 @@ def main():
     all_files = expand_paths_recursively(args.files)
 
     if not all_files:
-        display_error("No media files found to process")
-        return 1
+        exit_with_error("No media files found to process")
 
     total_files = len(all_files)
 
@@ -2299,74 +1892,41 @@ def main():
 
     # Handle status operation separately (read-only)
     if operation == "status":
-        # For status, we need to know what operation would be used
-        # Use refine as default operation for comparison
-        check_operation = "refine"
+        # Check if output file with -re suffix exists
         for file_path in all_files:
             path = Path(file_path)
-            status = check_file_status(path, config, check_operation)
 
             print(f"\n{'=' * 70}")
             print(f"File: {path}")
             print(f"{'=' * 70}")
 
-            if status["processed"]:
-                sig = status["metadata"]["signature"]
-                print(f"✓ Processed: YES")
-                print(f"  Operation:  {sig.get('operation', 'unknown')}")
-                print(f"  Codec:      {sig.get('codec', 'unknown')}")
-                print(f"  Format:     {sig.get('format', 'unknown')}")
-                print(f"  Preset:     {sig.get('preset', 'unknown')}")
-                print(f"  GPU:        {sig.get('use_gpu', False)}")
-
-                # Show actual encoding parameters from signature
-                if sig.get('crf') is not None:
-                    print(f"  CRF:        {sig['crf']}")
-                if sig.get('bitrate') is not None:
-                    print(f"  Bitrate:    {sig['bitrate'] // 1000}k")
-                if sig.get('resolution'):
-                    w, h = sig['resolution']
-                    print(f"  Resolution: {w}x{h}")
-                if sig.get('audio_bitrate'):
-                    print(f"  Audio BR:   {sig['audio_bitrate']}")
-                if sig.get('audio_codec'):
-                    print(f"  Audio Codec: {sig['audio_codec']}")
-
-                # Show file size comparison
-                if "details" in status["metadata"]:
-                    details = status["metadata"]["details"]
-                    if "input" in details:
-                        input_info = details["input"]
-                        orig_size = input_info.get("filesize", 0)
-                        curr_size = path.stat().st_size
-                        if orig_size > 0:
-                            ratio = curr_size / orig_size
-                            reduction = (1 - ratio) * 100
-                            print(f"\n  File size:")
-                            print(f"    Original:  {orig_size // 1_000_000} MB")
-                            print(f"    Processed: {curr_size // 1_000_000} MB")
-                            print(f"    Reduction: {reduction:.1f}%")
-
-                    # Show encoding details if available
-                    if "encoding" in details:
-                        enc = details["encoding"]
-                        print(f"\n  Encoding details:")
-                        for k, v in enc.items():
-                            print(f"    {k}: {v}")
-
-                print(f"\nWith current settings ({config.codec}, {config.preset.name}, GPU={config.use_gpu}):")
-                if status["will_reprocess"]:
-                    print(f"⚠ WILL REPROCESS")
-                    print(f"  {status['reason']}")
-                else:
-                    print(f"✓ WILL SKIP (already processed with identical settings)")
+            # Determine output extension based on file type
+            if is_video_file(path):
+                ext = config.format
+            elif is_image_file(path):
+                ext = "heic"
             else:
-                print(f"✗ Processed: NO")
-                print(f"  {status['reason']}")
+                print(f"  Unsupported file type")
+                continue
+
+            refined_path = final_output_path(path, ext, suffix="-re")
+
+            if refined_path.exists():
+                print(f"✓ Refined output exists: {refined_path.name}")
+                orig_size = path.stat().st_size
+                new_size = refined_path.stat().st_size
+                if orig_size > 0:
+                    reduction = (1 - new_size / orig_size) * 100
+                    print(f"  Original:  {orig_size / 1_000_000:.2f} MB")
+                    print(f"  Refined:   {new_size / 1_000_000:.2f} MB")
+                    print(f"  Reduction: {reduction:.1f}%")
+                print(f"\n✓ WILL SKIP (refined output already exists)")
+            else:
+                print(f"✗ No refined output found")
+                print(f"  Expected: {refined_path.name}")
+                print(f"\n⚠ WILL PROCESS")
 
         return 0
-
-    signature = build_run_signature(config, operation)
 
     if not config.interactive:
         display_info(f"Found {total_files} media files to process")
@@ -2405,7 +1965,7 @@ def main():
 
         path = Path(file_path)
 
-        if is_already_processed(file_path, signature):
+        if is_already_processed(file_path, operation, config):
             print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
             skipped += 1
             if tracker:
@@ -2415,14 +1975,14 @@ def main():
         if tracker:
             tracker.start_processing(path)
 
-        ok = process_single_file(file_path, operation, config, signature)
+        ok = process_single_file(file_path, operation, config)
         elapsed = time.time() - file_start
 
         if ok:
             processed += 1
             if tracker:
-                # Get new file path (might have different extension)
-                new_path = final_output_path(path, config.format)
+                # Get new file path (with -re suffix for refine)
+                new_path = final_output_path(path, config.format, suffix="-re")
                 tracker.mark_done(path, elapsed, new_path)
         else:
             print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True)
@@ -2439,6 +1999,9 @@ def main():
 
     # Progress and log files are kept for user review - no automatic cleanup
 
+    # In automator mode, always return 0 to avoid modal error dialogs
+    if config.automator:
+        return 0
     return 0 if failed == 0 else 1
 
 if __name__ == "__main__":
