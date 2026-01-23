@@ -8,20 +8,17 @@ No external Python dependencies required (only stdlib).
 ARCHITECTURE:
   - Configuration & Presets: Quality presets (meme/share/archive) + Config dataclass
   - Media File Abstraction: MediaFile class with cached metadata + VideoInfo
-  - Processed File Tracking: suffix-based (-re for refined files, -amv for AMV, etc.)
   - Codec Strategies: Pluggable codec strategies (H264/HEVC CPU/GPU, AV1)
   - Operations: Base Operation class for refine/amv/audiofy/loop_audio
   - Interactive Mode: Guided prompts for rare operations
   - CLI Interface: Simplified argument parsing with preset support
 
 USAGE:
-  Most common: automat.py video.mp4                        # Quick refine (creates video-re.mp4)
-  Memes:       automat.py --preset meme funny.mp4          # Smallest size
-  Batch:       automat.py -t ~/Downloads/videos/           # Process folder, trash originals
-  Interactive: automat.py -i video.mp4                     # Guided prompts
-  Auto:        automat.py --auto large_file.mov            # Auto-detect best preset
-  AMV:         automat.py --amv video.mov -a audio.mp3    # Add audio (creates video-amv.mp4)
-  Extract:     automat.py --audiofy video.mov              # Extract audio (creates video-audio.mp3)
+  Most common: automat.py video.mp4                    # Quick refine with defaults
+  Memes:       automat.py --preset meme funny.mp4      # Smallest size
+  Batch:       automat.py -t ~/Downloads/videos/       # Process folder, trash originals
+  Interactive: automat.py -i video.mp4                 # Guided prompts
+  Auto:        automat.py --auto large_file.mov        # Auto-detect best preset
 
 PRESETS:
   - meme:    Smallest size for sharing (CRF 28/32, 64k audio, max 1080p)
@@ -41,15 +38,9 @@ import json
 import shutil
 import os
 import time
-import secrets
-import signal
-import atexit
-import glob
-import mimetypes
-import uuid
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple
 from abc import ABC, abstractmethod
 
 # ============================================================================
@@ -77,23 +68,23 @@ class Config:
     """Runtime configuration"""
     preset: Preset
     codec: str = "h264"
-    format: str = "mp4"  # Default format for video output
+    format: str = "mov"
     use_gpu: bool = False
-    trash_originals: bool = False
+    trash: bool = False
     dry_run: bool = False
     interactive: bool = False
+    suffix: str = "-re"
     audio_file: Optional[Path] = None
-    log: bool = False
-    automator: bool = False  # macOS Automator mode: notify errors, exit 0
+    debug: bool = False
 
-# Global constants
+# Global settings (to be deprecated in favor of Config)
+RAW_LOG_FILE = ".automat-raw.log"
+TRASH_MODE = False
+DEBUG_MODE = False
+DRY_RUN = False
+SUFFIX = "-re"
 DEFAULT_CODEC = "h264"
-DEFAULT_FORMAT = "mp4"
-ORIGINAL_PREFIX = "~"
-
-# Global runtime state (set by main())
-_GLOBAL_CONFIG: Optional['Config'] = None
-_SESSION_CODE: Optional[str] = None  # Random code for this run (generated once)
+DEFAULT_FORMAT = "mov"
 
 # ANSI colors for stderr tags
 COLOR_RESET = "\x1b[0m"
@@ -138,25 +129,18 @@ class MediaFile:
 
     def __init__(self, path: Path):
         self.path = path if isinstance(path, Path) else Path(path)
-        self._mime_type: str = ""
+        self._mime_type: Optional[str] = None
         self._video_info: Optional[VideoInfo] = None
 
     @property
     def mime_type(self) -> str:
         """Cached MIME type detection"""
-        if not self._mime_type:
+        if self._mime_type is None:
             if not self.path.is_file():
                 self._mime_type = ""
             else:
-                if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
-                    guessed, _ = mimetypes.guess_type(str(self.path))
-                    self._mime_type = guessed or ""
-                else:
-                    res = run_command(["file", "--mime-type", "-b", str(self.path)])
-                    self._mime_type = res.stdout.strip()
-                    if not self._mime_type:
-                        guessed, _ = mimetypes.guess_type(str(self.path))
-                        self._mime_type = guessed or ""
+                res = run_command(["file", "--mime-type", "-b", str(self.path)])
+                self._mime_type = res.stdout.strip()
         return self._mime_type
 
     def is_video(self) -> bool:
@@ -167,9 +151,9 @@ class MediaFile:
         """Check if file is an image"""
         return self.mime_type.startswith("image/")
 
-    def is_already_processed(self, operation: str, config: 'Config') -> bool:
-        """Check if file was already processed by checking output file existence"""
-        return is_already_processed(self.path, operation, config)
+    def is_already_processed(self, suffix: str) -> bool:
+        """Check if file was already processed by looking for the suffix"""
+        return self.path.stem.endswith(suffix)
 
     def get_video_info(self) -> VideoInfo:
         """Get cached video metadata from ffprobe"""
@@ -216,335 +200,57 @@ DEFAULT_CRF_HEVC = 29    # Legacy - now defined in Preset dataclass
 
 logger = logging.getLogger(__name__)
 
-def setup_logging(log_path=None, debug=False):
+def setup_logging(log_path=None):
     logger.handlers = []            # Remove any existing handlers
     logger.propagate = False        # Don't propagate messages to root logger
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
     if log_path is not None:
         file_handler = logging.FileHandler(log_path)
         file_handler.setFormatter(logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s"))
         logger.addHandler(file_handler)
 
 def notify(title, message):
-    """Show a macOS notification (no-op on other platforms)"""
-    if sys.platform != "darwin":
-        return
+    """Show a macOS notification"""
     script = f'display notification "{message}" with title "{title}"'
     subprocess.run(["osascript", "-e", script], capture_output=True)
 
-def exit_with_error(message: str, code: int = 1):
-    """
-    Exit with error. In automator mode on macOS, show notification and exit 0.
-    On Linux or non-automator mode, print to stderr and exit with code.
-    """
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.automator and sys.platform == "darwin":
-        notify("Automat Error", message)
-        sys.exit(0)
-    else:
-        print(f"Error: {message}", file=sys.stderr)
-        sys.exit(code)
-
 def display_error(message):
     logger.error(message)
-
-def display_warning(message):
-    logger.warning(message)
 
 def display_info(message):
     logger.info(message)
 
 def display_debug(message):
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.log:
+    if DEBUG_MODE:
         logger.debug(message)
 
 def run_command(cmd: list[str]) -> subprocess.CompletedProcess:
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
+    if DRY_RUN:
         display_info(f"[DRY RUN] Would execute: {' '.join(cmd)}")
         return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
-
-PENDING_TEMP_OUTPUTS: set[Path] = set()
-
-def _normalize_ext(ext: str) -> str:
-    return ext[1:] if ext.startswith(".") else ext
-
-def _base_name(path: Path) -> str:
-    name = path.name
-    if name.startswith(ORIGINAL_PREFIX):
-        name = name[len(ORIGINAL_PREFIX):]
-    return Path(name).stem
-
-def make_temp_output_path(src: Path, ext: str) -> Path:
-    """
-    Generate a temporary output path with -tmp suffix.
-    If collision, appends a short random token.
-    """
-    ext = _normalize_ext(ext)
-    base = _base_name(src)
-
-    # First try simple -tmp suffix
-    candidate = src.parent / f"{base}-tmp.{ext}"
-    if not candidate.exists():
-        return candidate
-
-    # If collision, add short random token
-    for _ in range(100):
-        token = secrets.token_hex(2)
-        candidate = src.parent / f"{base}-tmp-{token}.{ext}"
-        if not candidate.exists():
-            return candidate
-
-    raise RuntimeError("Failed to generate unique temp path")
-
-def final_output_path(src: Path, ext: str, suffix: str = "") -> Path:
-    """
-    Generate final output path for processed file.
-
-    Args:
-        src: Source file path
-        ext: Output extension (e.g., 'mov', 'mp3')
-        suffix: Optional suffix to add before extension (e.g., '-amv', '-loop')
-
-    Returns:
-        Path like: src/basename-suffix.ext or src/basename.ext if no suffix
-    """
-    ext = _normalize_ext(ext)
-    base = _base_name(src)
-    if suffix:
-        return src.parent / f"{base}{suffix}.{ext}"
-    return src.parent / f"{base}.{ext}"
-
-def prefixed_original_path(src: Path) -> Path:
-    if src.name.startswith(ORIGINAL_PREFIX):
-        return src
-    return src.parent / f"{ORIGINAL_PREFIX}{src.name}"
-
-def safe_unlink(path: Path, label: str = "temp file"):
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except Exception as e:
-        display_error(f"Failed to remove {label}: {path} ({e})")
-
-def register_temp_output(path: Path):
-    PENDING_TEMP_OUTPUTS.add(path)
-
-def unregister_temp_output(path: Path):
-    PENDING_TEMP_OUTPUTS.discard(path)
-
-def cleanup_pending_temps():
-    for path in list(PENDING_TEMP_OUTPUTS):
-        safe_unlink(path, label="temp output")
-        PENDING_TEMP_OUTPUTS.discard(path)
-
-def install_signal_handlers():
-    atexit.register(cleanup_pending_temps)
-    def _handle_exit(signum, frame):
-        cleanup_pending_temps()
-        sys.exit(1)
-    signal.signal(signal.SIGINT, _handle_exit)
-    signal.signal(signal.SIGTERM, _handle_exit)
-
-def describe_file(path: Path) -> dict:
-    info = {"path": str(path)}
-    try:
-        stat = path.stat()
-        info["size"] = stat.st_size
-        info["mtime"] = int(stat.st_mtime)
-    except FileNotFoundError:
-        info["size"] = None
-        info["mtime"] = None
-    return info
-
-
-def is_already_processed(path: Path, operation: str, config: Config) -> bool:
-    """
-    Check if file has already been processed by checking if output file exists.
-
-    For suffix-based operations, checks if the output file with the appropriate
-    suffix already exists. This replaces the old metadata-based checking.
-    """
-    path = Path(path)
-
-    # Map operations to their output suffixes
-    suffix_map = {
-        "refine": "-re",
-        "amv": "-amv",
-        "audiofy": "-audio",
-        "loop_audio": "-loop",
-    }
-
-    suffix = suffix_map.get(operation)
-    if not suffix:
-        # Operations without suffix (like portrait) - don't skip
-        return False
-
-    # Determine output extension based on operation
-    if operation == "audiofy" and is_video_file(path):
-        # Audiofy extracts to mp3
-        ext = "mp3"
-    elif operation == "refine" and is_image_file(path):
-        # Image refine outputs to heic
-        ext = "heic"
-    else:
-        ext = config.format
-
-    output_path = final_output_path(path, ext, suffix=suffix)
-    return output_path.exists()
-
-def finalize_processed_output(
-    src: Path,
-    temp_out: Path,
-    final_out: Path,
-    config: Config,
-    rename_original: bool = False,
-) -> bool:
-    """
-    Finalize processed output with atomic operations and full rollback on failure.
-
-    Behavior:
-      1. Move temp_out -> final_out (new file with suffix like -re, -amv, etc.)
-      2. Optionally trash original src if --trash-originals is set
-
-    Args:
-        rename_original: Legacy parameter, no longer used (kept for compatibility).
-    """
-    prefixed_src = prefixed_original_path(src) if rename_original else None
-
-    if config.dry_run:
-        if rename_original:
-            display_info(f"[DRY RUN] Would finalize: {src} -> {prefixed_src}, {temp_out} -> {final_out}")
-        else:
-            display_info(f"[DRY RUN] Would finalize: {temp_out} -> {final_out} (keeping {src} untouched)")
-        unregister_temp_output(temp_out)
-        return True
-
-    # Track state for rollback
-    src_was_renamed = False
-    final_out_existed = final_out.exists()
-    final_out_backup = None
-
-    try:
-        # Step 1: Rename source to prefixed FIRST (only if rename_original=True)
-        # This prevents issues when final_out == src (same base name)
-        if rename_original and prefixed_src and prefixed_src != src:
-            src.replace(prefixed_src)
-            src_was_renamed = True
-
-        # Step 2: Backup existing final_out if it exists
-        # Only needed if we're replacing an existing file (not the original source)
-        if final_out_existed and final_out.exists():
-            # Don't backup if final_out was the original source that we just renamed
-            if not (rename_original and final_out.resolve() == src.resolve()):
-                final_out_backup = final_out.parent / f".automat-backup-{uuid.uuid4().hex}{final_out.suffix}"
-                final_out.replace(final_out_backup)
-
-        # Step 3: Move temp output to final location
-        try:
-            temp_out.replace(final_out)
-        except OSError as move_error:
-            # If replace fails, try shutil.move as fallback
-            display_debug(f"Path.replace failed ({move_error}), trying shutil.move")
-            try:
-                shutil.move(str(temp_out), str(final_out))
-            except OSError as shutil_error:
-                if shutil_error.errno == 1:  # Operation not permitted
-                    raise OSError(
-                        f"Permission denied when moving file. "
-                        f"If using Automator, grant Full Disk Access in System Settings → Privacy & Security. "
-                        f"Original error: {shutil_error}"
-                    ) from shutil_error
-                else:
-                    raise
-
-        # Success - cleanup backup if it exists
-        if final_out_backup and final_out_backup.exists():
-            safe_unlink(final_out_backup, label="backup file")
-
-    except Exception as e:
-        error_msg = str(e)
-        display_error(f"Finalize failed for {src}: {error_msg}")
-
-        # Show macOS notification for permission errors (avoids Automator modal popup)
-        if "Permission denied" in error_msg or "Operation not permitted" in error_msg:
-            notify("Automat Error", f"Permission denied: {src.name}. Grant Full Disk Access in System Settings.")
-
-        # Rollback: restore original state
-        # 1. Restore final_out from backup
-        if final_out_backup and final_out_backup.exists():
-            try:
-                final_out_backup.replace(final_out)
-            except Exception as restore_error:
-                logger.warning(f"Failed to restore backup: {final_out_backup} -> {final_out} ({restore_error})")
-
-        # 2. Restore src from prefixed_src (only if it was renamed)
-        if src_was_renamed and prefixed_src and prefixed_src.exists() and not src.exists():
-            try:
-                prefixed_src.replace(src)
-            except Exception as restore_error:
-                logger.warning(f"Failed to restore original: {prefixed_src} -> {src} ({restore_error})")
-
-        # 3. Cleanup temp output
-        safe_unlink(temp_out, label="temp output")
-
-        return False
-    finally:
-        unregister_temp_output(temp_out)
-
-    # Trash original if requested
-    if config.trash_originals:
-        move_to_trash(src)
-    return True
-
-def cleanup_temp_output(temp_out: Path):
-    unregister_temp_output(temp_out)
-    safe_unlink(temp_out, label="temp output")
 
 def is_video_file(path) -> bool:
     path = Path(path)
     if not path.is_file():
         return False
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
-        guessed, _ = mimetypes.guess_type(str(path))
-        return (guessed or "").startswith("video/")
     res = run_command(["file", "--mime-type", "-b", str(path)])
-    mime = res.stdout.strip()
-    if not mime:
-        guessed, _ = mimetypes.guess_type(str(path))
-        mime = guessed or ""
-    return mime.startswith("video/")
-
-def is_audio_file(path) -> bool:
-    path = Path(path)
-    if not path.is_file():
-        return False
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
-        guessed, _ = mimetypes.guess_type(str(path))
-        return (guessed or "").startswith("audio/")
-    res = run_command(["file", "--mime-type", "-b", str(path)])
-    mime = res.stdout.strip()
-    if not mime:
-        guessed, _ = mimetypes.guess_type(str(path))
-        mime = guessed or ""
-    return mime.startswith("audio/")
+    return res.stdout.strip().startswith("video/")
 
 def is_image_file(path) -> bool:
     path = Path(path)
     if not path.is_file():
         return False
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
-        guessed, _ = mimetypes.guess_type(str(path))
-        return (guessed or "").startswith("image/")
     res = run_command(["file", "--mime-type", "-b", str(path)])
-    mime = res.stdout.strip()
-    if not mime:
-        guessed, _ = mimetypes.guess_type(str(path))
-        mime = guessed or ""
-    return mime.startswith("image/")
+    return res.stdout.strip().startswith("image/")
+
+def is_already_processed(path):
+    """Check if file was already processed by looking for the suffix"""
+    path = Path(path)
+    return path.stem.endswith(SUFFIX)
 
 def move_to_trash(path):
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
+    if DRY_RUN:
         display_info(f"[DRY RUN] Would move to trash: {path}")
         return
 
@@ -552,11 +258,6 @@ def move_to_trash(path):
     if not path.exists():
         logger.error("File not found for trashing: %s", path)
         return
-
-    if sys.platform != "darwin":
-        display_warning(f"Trash not supported on this platform, skipping: {path}")
-        return
-
     script = f'''
     tell application "Finder"
         move POSIX file "{path.as_posix()}" to trash
@@ -572,22 +273,13 @@ def move_to_trash(path):
 def get_video_info(source):
     source = Path(source)
     logger.debug("Getting info for: %s", source)
-    if _GLOBAL_CONFIG and _GLOBAL_CONFIG.dry_run:
-        filesize = source.stat().st_size if source.exists() else 0
-        return 0, 0, 0.0, 0, filesize
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
            "-show_format", "-show_streams", str(source)]
     res = run_command(cmd)
-    if res.returncode != 0 or not res.stdout.strip():
+    if res.returncode != 0:
         display_error(f"ffprobe error on {source}")
-        filesize = source.stat().st_size if source.exists() else 0
-        return 0,0,0.0,0,filesize
-    try:
-        info = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        display_error(f"ffprobe returned invalid JSON for {source}")
-        filesize = source.stat().st_size if source.exists() else 0
-        return 0,0,0.0,0,filesize
+        return 0,0,0.0,0,0
+    info = json.loads(res.stdout)
     stream = next((s for s in info.get("streams",[]) if s.get("codec_type")=="video"), {})
     width = stream.get("width", 0) or 0
     height = stream.get("height",0) or 0
@@ -703,9 +395,9 @@ def is_videotoolbox_available():
     res = run_command(["ffmpeg", "-encoders"])
     return "videotoolbox" in res.stdout
 
-def build_ffmpeg_command(src, codec, fmt, out, is_cpu=None, crf_value=None, dynamic_bitrate=None):
+def build_ffmpeg_command(src, codec, fmt, is_cpu=None, crf_value=None, dynamic_bitrate=None):
     src = Path(src)
-    out = Path(out)
+    out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
 
     # Determine if we should use CPU (libx264/libx265) or GPU (videotoolbox).
     if is_cpu is None:
@@ -818,10 +510,10 @@ class Operation(ABC):
 
     def _cleanup_source(self, media: MediaFile, config: Config):
         """Common cleanup logic - move to trash if requested"""
-        if config.trash_originals and not config.dry_run:
+        if config.trash and not config.dry_run:
             move_to_trash(media.path)
 
-def process_video_refine(src, config: Config):
+def process_video_refine(src, codec, fmt, is_cpu=None):
     """
     Refine a video file by re-encoding it
     - For CPU: dynamically choose CRF based on source bitrate and resolution.
@@ -854,16 +546,14 @@ def process_video_refine(src, config: Config):
     crf_value = None
     dynamic_bitrate = None
 
-    is_cpu = not config.use_gpu
-
     if is_cpu:
         # Aggressive CRF selection for CPU encoder
-        if config.codec == "h264":
+        if codec == "h264":
             if br > 0 and br < low_bitrate_thresh:
                 crf_value = 28
             else:
                 crf_value = 24
-        elif config.codec == "hevc":
+        elif codec == "hevc":
             if br > 0 and br < low_bitrate_thresh:
                 crf_value = 32
             else:
@@ -885,48 +575,39 @@ def process_video_refine(src, config: Config):
 
     # For AMV and loop_audio, behavior is unchanged (handled outside)
     # For refine: pass new crf_value/dynamic_bitrate
-    temp_out = make_temp_output_path(src, config.format)
-    final_out = final_output_path(src, config.format, suffix="-re")
-    register_temp_output(temp_out)
-
-    cmd, _ = build_ffmpeg_command(
-        src, config.codec, config.format, temp_out,
+    cmd, out = build_ffmpeg_command(
+        src, codec, fmt,
         is_cpu=is_cpu, crf_value=crf_value, dynamic_bitrate=dynamic_bitrate
     )
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
-    if res.returncode != 0 and not config.dry_run:
+    if res.returncode != 0 and not DRY_RUN:
         display_error("ffmpeg failed")
-        cleanup_temp_output(temp_out)
         return False
-    if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-        display_error(f"Output missing: {temp_out}")
-        cleanup_temp_output(temp_out)
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
         return False
     orig_sz = src.stat().st_size
-    new_sz = temp_out.stat().st_size if not config.dry_run else int(orig_sz * 0.7)  # Estimate for dry run
+    new_sz = out.stat().st_size if not DRY_RUN else int(orig_sz * 0.7)  # Estimate for dry run
     red = (1 - new_sz / orig_sz) * 100 if orig_sz > 0 else 0
     display_info(f"{orig_sz/1e6:.2f}→{new_sz/1e6:.2f} MB ({red:.1f}% reduction)")
-    # Don't rename original - just create the -re output alongside it
-    # This avoids permission issues with Automator
-    return finalize_processed_output(src, temp_out, final_out, config, rename_original=False)
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
 
-def process_video_amv(src, audio_track, config: Config):
+def process_video_amv(src, audio_track, codec, fmt, is_cpu=None):
     """Add or replace audio track in video (AMV operation)"""
     src = Path(src)
     audio_track = Path(audio_track)
-    temp_out = make_temp_output_path(src, config.format)
-    final_out = final_output_path(src, config.format, suffix="-amv")
-    register_temp_output(temp_out)
+    out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
 
     if not audio_track.exists():
         display_error(f"Audio track not found: {audio_track}")
-        cleanup_temp_output(temp_out)
         return False
 
     # Build FFmpeg command for AMV operation
     cmd = ["ffmpeg"]
-    if config.use_gpu:
+    if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
 
     cmd += [
@@ -940,29 +621,27 @@ def process_video_amv(src, audio_track, config: Config):
         "-shortest",           # End when shortest stream ends
         "-movflags", "+faststart",
         "-y",
-        str(temp_out)
+        str(out)
     ]
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
-    if res.returncode != 0 and not config.dry_run:
+    if res.returncode != 0 and not DRY_RUN:
         display_error("ffmpeg AMV failed")
-        cleanup_temp_output(temp_out)
         return False
-    if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-        display_error(f"Output missing: {temp_out}")
-        cleanup_temp_output(temp_out)
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
         return False
 
-    display_info(f"AMV created: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config)
+    display_info(f"AMV created: {out}")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
 
-def process_video_loop_audio(src, config: Config):
+def process_video_loop_audio(src, codec, fmt, is_cpu=None):
     """Loop audio to match video duration"""
     src = Path(src)
-    temp_out = make_temp_output_path(src, config.format)
-    final_out = final_output_path(src, config.format, suffix="-loop")
-    register_temp_output(temp_out)
+    out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
 
     # Get video and audio duration info
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -970,7 +649,6 @@ def process_video_loop_audio(src, config: Config):
     res = run_command(cmd)
     if res.returncode != 0:
         display_error(f"ffprobe error on {src}")
-        cleanup_temp_output(temp_out)
         return False
 
     info = json.loads(res.stdout)
@@ -979,14 +657,13 @@ def process_video_loop_audio(src, config: Config):
 
     if not video_stream or not audio_stream:
         display_error(f"Missing video or audio stream in {src}")
-        cleanup_temp_output(temp_out)
         return False
 
     video_duration = float(video_stream.get("duration", 0) or info.get("format",{}).get("duration", 0))
 
     # Build FFmpeg command to loop audio
     cmd = ["ffmpeg"]
-    if config.use_gpu:
+    if is_cpu is False:
         cmd += ["-hwaccel", "videotoolbox"]
 
     cmd += [
@@ -998,158 +675,66 @@ def process_video_loop_audio(src, config: Config):
         "-t", str(video_duration),  # Stop at video duration
         "-movflags", "+faststart",
         "-y",
-        str(temp_out)
+        str(out)
     ]
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
-    if res.returncode != 0 and not config.dry_run:
+    if res.returncode != 0 and not DRY_RUN:
         display_error("ffmpeg loop_audio failed")
-        cleanup_temp_output(temp_out)
         return False
-    if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-        display_error(f"Output missing: {temp_out}")
-        cleanup_temp_output(temp_out)
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
         return False
 
-    display_info(f"Audio looped: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config)
+    display_info(f"Audio looped: {out}")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
 
-def process_video_audiofy(src, config: Config):
+def process_video_audiofy(src, codec, fmt):
     """Extract audio from video and save as audio file"""
     src = Path(src)
-    temp_out = make_temp_output_path(src, "mp3")
-    final_out = final_output_path(src, "mp3", suffix="-audio")
-    register_temp_output(temp_out)
+    out = src.parent / f"{src.stem}{SUFFIX}.mp3"
 
-    cmd = ["ffmpeg", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(temp_out)]
+    cmd = ["ffmpeg", "-i", str(src), "-vn", "-c:a", "libmp3lame", "-b:a", "192k", "-y", str(out)]
 
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
-    if res.returncode != 0 and not config.dry_run:
+    if res.returncode != 0 and not DRY_RUN:
         display_error("ffmpeg audiofy failed")
-        cleanup_temp_output(temp_out)
         return False
-    if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-        display_error(f"Output missing: {temp_out}")
-        cleanup_temp_output(temp_out)
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
         return False
 
-    display_info(f"Audio extracted: {temp_out}")
-    return finalize_processed_output(src, temp_out, final_out, config)
+    display_info(f"Audio extracted: {out}")
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
 
-def process_image(src, config: Config):
+def process_image(src):
     src = Path(src)
-    temp_out = make_temp_output_path(src, "heic")
-    final_out = final_output_path(src, "heic", suffix="-re")
-    register_temp_output(temp_out)
-
-    cmd = ["sips","-s","format","heic",str(src),"--out",str(temp_out)]
+    out = src.parent / f"{src.stem}{SUFFIX}.heic"
+    cmd = ["sips","-s","format","heic",str(src),"--out",str(out)]
     logger.info("Running: " + " ".join(cmd))
     res = run_command(cmd)
-    if res.returncode != 0 and not config.dry_run:
+    if res.returncode != 0 and not DRY_RUN:
         display_error("sips failed")
-        cleanup_temp_output(temp_out)
         return False
-    if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-        display_error(f"Output missing: {temp_out}")
-        cleanup_temp_output(temp_out)
+    if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+        display_error(f"Output missing: {out}")
         return False
     orig_sz = src.stat().st_size
-    new_sz = temp_out.stat().st_size if not config.dry_run else int(orig_sz * 0.5)  # Estimate for dry run
+    new_sz = out.stat().st_size if not DRY_RUN else int(orig_sz * 0.5)  # Estimate for dry run
     red = (1-new_sz/orig_sz)*100 if orig_sz>0 else 0
     display_info(f"{orig_sz/1e3:.2f}→{new_sz/1e3:.2f} KB ({red:.1f}% reduction)")
-    # Don't rename original - just create the -re output alongside it
-    return finalize_processed_output(src, temp_out, final_out, config, rename_original=False)
+    if TRASH_MODE:
+        move_to_trash(src)
+    return True
 
-def process_portrait(src, config: Config):
-    """Generate Baldur's Gate portrait sizes as 24-bit BMPs."""
-    src = Path(src)
-    portraits_dir = src.parent / "Portraits"
-    if config.dry_run:
-        display_info(f"[DRY RUN] Would create folder: {portraits_dir}")
-    else:
-        try:
-            portraits_dir.mkdir(exist_ok=True)
-        except Exception as e:
-            display_error(f"Failed to create Portraits folder: {e}")
-            return False
-
-    sizes = [
-        ("L", 420, 660),
-        ("M", 338, 532),
-        ("S", 108, 168),
-    ]
-
-    success = True
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        for suffix, width, height in sizes:
-            temp_resample = tmpdir_path / f"{src.stem}_{suffix}_resample.png"
-            temp_cropped = tmpdir_path / f"{src.stem}_{suffix}_crop.png"
-            out = portraits_dir / f"{src.stem}{suffix}.bmp"
-
-            cmd_resample = ["sips", "--resampleHeight", str(height), str(src), "--out", str(temp_resample)]
-            logger.info("Running: " + " ".join(cmd_resample))
-            res = run_command(cmd_resample)
-            if res.returncode != 0 and not config.dry_run:
-                display_error("sips resample failed")
-                success = False
-                break
-
-            cmd_crop_png = [
-                "sips",
-                "--cropToHeightWidth", str(height), str(width),
-                "-s", "format", "png",
-                str(temp_resample),
-                "--out", str(temp_cropped),
-            ]
-            logger.info("Running: " + " ".join(cmd_crop_png))
-            res = run_command(cmd_crop_png)
-            if res.returncode != 0 and not config.dry_run:
-                display_error("sips crop failed")
-                success = False
-                break
-
-            cmd_bmp = [
-                "ffmpeg",
-                "-y",
-                "-i", str(temp_cropped),
-                "-vf", "format=bgr24",
-                str(out),
-            ]
-            logger.info("Running: " + " ".join(cmd_bmp))
-            ffmpeg_path = shutil.which("ffmpeg")
-            if not ffmpeg_path and not config.dry_run:
-                display_error("ffmpeg not found (required for 24-bit BMP output)")
-                success = False
-                break
-            if ffmpeg_path:
-                cmd_bmp[0] = ffmpeg_path
-            res = run_command(cmd_bmp)
-            if res.returncode != 0 and not config.dry_run:
-                display_error("ffmpeg bmp conversion failed")
-                success = False
-                break
-            if not config.dry_run and (not out.is_file() or out.stat().st_size == 0):
-                display_error(f"Output missing: {out}")
-                success = False
-                break
-
-            display_info(f"Portrait created: {out}")
-
-    if success:
-        # For portrait operation, keep the original image completely untouched
-        # No metadata tracking, no renaming, no backup - just create the BMP outputs
-        if config.dry_run:
-            display_info(f"[DRY RUN] Portrait operation complete, original {src} untouched")
-        else:
-            display_info(f"Portrait operation complete, original {src} kept untouched")
-        return True
-    return False
-
-def process_single_file(file_path, operation, config: Config):
-    """Process a single file with the specified operation"""
+def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=None):
+    """Process a single file with the specified operations"""
     file_path = Path(file_path)
 
     # Convert to absolute path if not already
@@ -1160,50 +745,54 @@ def process_single_file(file_path, operation, config: Config):
         display_error(f"File not found: {file_path}")
         return False
 
+    # Skip if already processed
+    if is_already_processed(file_path):
+        display_info(f"Skipping already processed file: {file_path}")
+        return True
+
     success = True
     # Process based on file type and operations
     if is_video_file(file_path):
         display_info(f"Processing video: {file_path}")
-        if operation == "refine":
-            if not process_video_refine(file_path, config):
-                success = False
-        elif operation == "amv":
-            if not config.audio_file:
-                display_error("AMV operation requires audio track (-a parameter)")
-                success = False
-            elif not process_video_amv(file_path, config.audio_file, config):
-                success = False
-        elif operation == "loop_audio":
-            if not process_video_loop_audio(file_path, config):
-                success = False
-        elif operation == "audiofy":
-            if not process_video_audiofy(file_path, config):
-                success = False
-        elif operation == "portrait":
-            display_info(f"Skipping portrait for video: {file_path}")
+        for operation in operations:
+            if operation == "refine":
+                if not process_video_refine(file_path, codec, fmt, is_cpu=is_cpu):
+                    success = False
+            elif operation == "amv":
+                if not audio_track:
+                    display_error("AMV operation requires audio track (-a parameter)")
+                    success = False
+                elif not process_video_amv(file_path, audio_track, codec, fmt, is_cpu=is_cpu):
+                    success = False
+            elif operation == "loop_audio":
+                if not process_video_loop_audio(file_path, codec, fmt, is_cpu=is_cpu):
+                    success = False
+            elif operation == "audiofy":
+                if not process_video_audiofy(file_path, codec, fmt):
+                    success = False
+
     elif is_image_file(file_path):
         display_info(f"Processing image: {file_path}")
-        if operation == "refine":
-            if not process_image(file_path, config):
-                success = False
-        elif operation == "portrait":
-            if not process_portrait(file_path, config):
-                success = False
-        elif operation == "audiofy" and config.audio_file:
-            if not process_image_audiofy(file_path, config.audio_file, config):
-                success = False
-        else:
-            if operation not in ("refine", "audiofy", "portrait"):
-                display_info(f"Skipping image (no supported operations): {file_path}")
+        for operation in operations:
+            if operation == "refine":
+                if not process_image(file_path):
+                    success = False
+            elif operation == "audiofy" and audio_track:
+                if not process_image_audiofy(file_path, audio_track, codec, fmt):
+                    success = False
+            else:
+                if operation not in ("refine", "audiofy"):
+                    display_info(f"Skipping image (no supported operations): {file_path}")
     else:
         display_error(f"Unsupported file type: {file_path}")
         success = False
     return success
-def process_image_audiofy(src, audio_track, config: Config):
+def process_image_audiofy(src, audio_track, codec, fmt):
     """
     Given an image and an audio track, create a video of the image with the audio.
     If audio_track is a video, extract its audio stream first.
     """
+    import uuid
     src = Path(src)
     audio_track = Path(audio_track)
     tmp_audio = None
@@ -1219,7 +808,7 @@ def process_image_audiofy(src, audio_track, config: Config):
             ]
             logger.info("Extracting audio from video: " + " ".join(cmd_extract))
             res = run_command(cmd_extract)
-            if res.returncode != 0 and not config.dry_run:
+            if res.returncode != 0 and not DRY_RUN:
                 display_error("Failed to extract audio from video for image+audio operation")
                 return False
             audio_input = tmp_audio
@@ -1237,9 +826,7 @@ def process_image_audiofy(src, audio_track, config: Config):
         duration = float(res.stdout.strip())
 
         # Output filename
-        temp_out = make_temp_output_path(src, config.format)
-        final_out = final_output_path(src, config.format, suffix="-amv")
-        register_temp_output(temp_out)
+        out = src.parent / f"{src.stem}{SUFFIX}.{fmt}"
 
         # Build ffmpeg command to create video from image + audio
         # Use -loop 1 to repeat image, -framerate 30, -t for duration, -shortest for audio, -r 30 before output
@@ -1249,7 +836,7 @@ def process_image_audiofy(src, audio_track, config: Config):
             "-framerate", "30",
             "-i", str(src),
             "-i", str(audio_input),
-            "-c:v", "libx264" if config.codec == "h264" else ("libx265" if config.codec == "hevc" else "libaom-av1"),
+            "-c:v", "libx264" if codec == "h264" else ("libx265" if codec == "hevc" else "libaom-av1"),
             "-t", str(duration),
             "-c:a", "aac",
             "-b:a", "192k",
@@ -1258,20 +845,20 @@ def process_image_audiofy(src, audio_track, config: Config):
             "-movflags", "+faststart",
             "-r", "30",
             "-y",
-            str(temp_out)
+            str(out)
         ]
         logger.info("Running: " + " ".join(str(x) for x in cmd))
         res = run_command(cmd)
-        if res.returncode != 0 and not config.dry_run:
+        if res.returncode != 0 and not DRY_RUN:
             display_error("ffmpeg failed to create video from image and audio")
-            cleanup_temp_output(temp_out)
             return False
-        if not config.dry_run and (not temp_out.is_file() or temp_out.stat().st_size == 0):
-            display_error(f"Output missing: {temp_out}")
-            cleanup_temp_output(temp_out)
+        if not DRY_RUN and (not out.is_file() or out.stat().st_size == 0):
+            display_error(f"Output missing: {out}")
             return False
-        display_info(f"Created video from image and audio: {temp_out}")
-        return finalize_processed_output(src, temp_out, final_out, config)
+        display_info(f"Created video from image and audio: {out}")
+        if TRASH_MODE:
+            move_to_trash(src)
+        return True
     finally:
         # Clean up temp audio file if it was created
         if tmp_audio is not None and Path(tmp_audio).exists():
@@ -1280,34 +867,11 @@ def process_image_audiofy(src, audio_track, config: Config):
             except Exception as e:
                 logger.warning(f"Failed to clean up temp audio file: {tmp_audio} ({e})")
 
-# Suffixes that indicate a file was already processed
-PROCESSED_SUFFIXES = ("-re", "-amv", "-audio", "-loop", "-tmp")
-
-def _is_processed_file(path: Path) -> bool:
-    """Check if file has a suffix indicating it was already processed."""
-    stem = path.stem
-    for suffix in PROCESSED_SUFFIXES:
-        if stem.endswith(suffix):
-            return True
-    return False
-
 def expand_paths_recursively(paths):
     """Recursively expand all given paths into a flat list of media files"""
-    expanded_inputs = []
-    for path_str in paths:
-        path_str = os.path.expanduser(path_str)
-        if any(ch in path_str for ch in "*?[]"):
-            matches = glob.glob(path_str)
-            if matches:
-                expanded_inputs.extend(matches)
-            else:
-                display_error(f"No matches for pattern: {path_str}")
-        else:
-            expanded_inputs.append(path_str)
-
     expanded_files = []
 
-    for path_str in expanded_inputs:
+    for path_str in paths:
         path = Path(path_str)
 
         # Convert to absolute path
@@ -1315,21 +879,13 @@ def expand_paths_recursively(paths):
             path = Path(os.getcwd()) / path
 
         if path.is_file():
-            # Single file - add if it's a media file and not already processed
-            if path.name.startswith(ORIGINAL_PREFIX):
-                continue
-            if _is_processed_file(path):
-                continue
+            # Single file - add if it's a media file (include already-processed too)
             if is_video_file(path) or is_image_file(path):
                 expanded_files.append(path)
         elif path.is_dir():
-            # Directory - recursively find all media files (skip already-processed)
+            # Directory - recursively find all media files (include already-processed too)
             for file_path in path.rglob("*"):
                 if file_path.is_file():
-                    if file_path.name.startswith(ORIGINAL_PREFIX):
-                        continue
-                    if _is_processed_file(file_path):
-                        continue
                     if is_video_file(file_path) or is_image_file(file_path):
                         expanded_files.append(file_path)
         else:
@@ -1346,7 +902,7 @@ def expand_paths_recursively(paths):
     return unique_files
 
 def get_base_path(paths):
-    """Get the base path for progress log files from the first path argument.
+    """Get the base path for progress/error log files from the first path argument.
     If the first argument is a directory, use its parent directory.
     If it's a file, use its parent directory as well.
     Otherwise, default to the current working directory.
@@ -1369,7 +925,34 @@ def get_base_path(paths):
         # In case of any filesystem access issues, fall back to CWD
         return Path.cwd()
 
-# Old progress tracking functions removed - now using ProgressTracker class
+def update_progress_file(progress_file, total, done, skipped, failed):
+    """
+    Update the progress tracking file (.automat-progress.log) with new structure.
+    """
+    if DRY_RUN:
+        display_info(f"[DRY RUN] Would update progress: {total}/{done}/{skipped}/{failed}")
+        return
+    try:
+        with open(progress_file, 'w') as f:
+            f.write(f"Total: {total}\n")
+            f.write(f"Done: {done}\n")
+            f.write(f"Skipped: {skipped}\n")
+            f.write(f"Failed: {failed}\n")
+    except Exception as e:
+        display_error(f"Failed to update progress file: {e}")
+
+def log_error_file(error_file, file_path):
+    """
+    Append failed file path to error log (.automat-failed.log).
+    """
+    if DRY_RUN:
+        display_info(f"[DRY RUN] Would log error: {file_path}")
+        return
+    try:
+        with open(error_file, 'a') as f:
+            f.write(f"{file_path}\n")
+    except Exception as e:
+        display_error(f"Failed to write to error file: {e}")
 
 def refine_recursively(directory, codec, fmt):
     """Recursively process all files in directory (legacy function for compatibility)"""
@@ -1377,62 +960,57 @@ def refine_recursively(directory, codec, fmt):
     files = expand_paths_recursively([directory])
     total = len(files)
     display_info(f"Found {total} files")
-    # Use global config if available, otherwise create default
-    config = _GLOBAL_CONFIG or Config(
-        preset=PRESETS["share"],
-        codec=codec,
-        format=fmt,
-        use_gpu=False,
-        trash_originals=False,
-        dry_run=False,
-        interactive=False,
-        audio_file=None,
-        log=False,
-        automator=False,
-    )
 
-    # Set up progress tracking (legacy function - uses old format)
+    # Set up progress tracking
     base_path = get_base_path([directory])
     progress_file = base_path / ".automat-progress.log"
+    error_file = base_path / ".automat-failed.log"
 
     # Initialize logs: start fresh
-    if not config.dry_run:
+    if not DRY_RUN:
         if progress_file.exists():
             try: progress_file.unlink()
             except Exception as e: display_error(f"Failed to remove existing progress log: {e}")
+        if error_file.exists():
+            try: error_file.unlink()
+            except Exception as e: display_error(f"Failed to remove existing error log: {e}")
         try:
             progress_file.touch()
+            error_file.touch()
         except Exception as e:
-            display_error(f"Failed to create log file: {e}")
+            display_error(f"Failed to create log files: {e}")
 
     # Counters
     proc = fail = skipped = 0
+    update_progress_file(progress_file, total, proc, skipped, fail)
 
     for path in files:
         n = proc + skipped + fail + 1
         print(f"{n}/{total}: {path}", flush=True)
-        if is_already_processed(path, "refine", config):
+        if is_already_processed(path):
             print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {path}", file=sys.stderr, flush=True)
             skipped += 1
+            update_progress_file(progress_file, total, proc, skipped, fail)
             continue
 
         display_info(f"[{n}/{total}] Processing: {path}")
-        if process_single_file(path, "refine", config):
+        if process_single_file(path, ["refine"], None, codec, fmt):
             proc += 1
         else:
             print(f"{color_tag('[Failed]', COLOR_RED)} {path}", file=sys.stderr, flush=True)
             fail += 1
-            # Failed files are no longer logged to separate file
+            log_error_file(error_file, path)
+        update_progress_file(progress_file, total, proc, skipped, fail)
 
     display_info(f"Done. Processed: {proc}, Skipped: {skipped}, Failed: {fail}")
-    if not config.dry_run:
+    if not DRY_RUN:
         notify("Automat", f"Processed {proc} files, {fail} failed")
-        # Auto-remove progress log if no failures
-        if fail == 0 and progress_file.exists():
-            try:
-                progress_file.unlink()
-            except Exception as e:
-                display_error(f"Failed to remove log file {progress_file}: {e}")
+        # Auto-remove logs if no failures
+        if fail == 0:
+            for f in (progress_file, error_file):
+                if f.exists():
+                    try: f.unlink()
+                    except Exception as e: display_error(f"Failed to remove log file {f}: {e}")
 
 # ============================================================================
 # INTERACTIVE MODE
@@ -1456,7 +1034,6 @@ class InteractiveMode:
         print("3. Loop audio to match video length")
         print("4. Extract audio to MP3")
         print("5. Create video from image + audio")
-        print("6. Create Baldur's Gate portraits from images")
         print()
 
         choice = input("Choice [1]: ").strip() or "1"
@@ -1505,8 +1082,6 @@ class InteractiveMode:
                 print(f"Error: Audio file not found: {audio}")
                 return (["refine"], config)
             operations.append("audiofy")
-        elif choice == "6":
-            operations.append("portrait")
 
         else:
             print(f"Invalid choice: {choice}, defaulting to refine")
@@ -1519,14 +1094,14 @@ class InteractiveMode:
             if codec_choice in ["h264", "hevc", "av1"]:
                 config.codec = codec_choice
 
-            trash_choice = input("Move original files to trash after processing? [y/N]: ").strip().lower()
-            config.trash_originals = trash_choice == "y"
+            trash_choice = input("Move originals to trash? [y/N]: ").strip().lower()
+            config.trash = trash_choice == "y"
 
         print(f"\nReady to process {len(files)} file(s)")
         print(f"Operations: {', '.join(operations)}")
         print(f"Codec: {config.codec}")
         print(f"Preset: {config.preset.name}")
-        print(f"Trash originals: {'Yes' if config.trash_originals else 'No'}")
+        print(f"Trash originals: {'Yes' if config.trash else 'No'}")
         print()
         confirm = input("Proceed? [Y/n]: ").strip().lower()
         if confirm == "n":
@@ -1535,183 +1110,18 @@ class InteractiveMode:
 
         return (operations, config)
 
-# ============================================================================
-# PROGRESS TRACKING
-# ============================================================================
-
-@dataclass
-class FileProgress:
-    """Track progress for a single file"""
-    path: Path
-    status: str  # "Pending", "Skipped", "Recoding", "Done", "Failed"
-    time_taken: float = 0.0  # seconds
-    original_size: int = 0
-    new_size: int = 0
-    original_params: str = ""
-    new_params: str = ""
-
-class ProgressTracker:
-    """
-    Manages progress tracking in a markdown table file.
-    Filename format: automat-XXXXX-progress-total-done-failed.md
-    """
-    def __init__(self, base_path: Path, session_code: str):
-        self.base_path = base_path
-        self.session_code = session_code
-        self.files: Dict[Path, FileProgress] = {}
-        self.current_file: Optional[Path] = None
-
-    def get_progress_filename(self) -> Path:
-        """Generate filename based on current counters"""
-        total = len(self.files)
-        done = sum(1 for f in self.files.values() if f.status in ("Done", "Skipped"))
-        failed = sum(1 for f in self.files.values() if f.status == "Failed")
-        return self.base_path / f"automat-{self.session_code}-progress-{total}-{done}-{failed}.md"
-
-    def initialize(self, file_paths: List[Path]):
-        """Initialize with all files as Pending"""
-        for path in file_paths:
-            # Get file info for original params
-            info = describe_file(path)
-            original_params = self._format_file_params(path, info)
-
-            self.files[path] = FileProgress(
-                path=path,
-                status="Pending",
-                original_size=info.get("size") or 0,
-                original_params=original_params,
-            )
-
-        self._write_table()
-
-    def _format_file_params(self, path: Path, info: dict) -> str:
-        """Format file parameters based on file type"""
-        if is_video_file(path) or is_audio_file(path):
-            # Video params: resolution, fps, codec, bitrate
-            width = info.get("width", 0)
-            height = info.get("height", 0)
-            bitrate = info.get("bitrate", 0)
-            duration = info.get("duration", 0)
-
-            params = []
-            if width and height:
-                params.append(f"{width}×{height}")
-            # FPS would need to be extracted from ffprobe - skip for now
-            if bitrate:
-                params.append(f"{int(bitrate/1000)}kbps")
-            if duration:
-                mins = int(duration / 60)
-                params.append(f"{mins}m")
-
-            return " ".join(params) if params else "-"
-
-        elif is_image_file(path):
-            # Image params: format, dimensions
-            # Would need sips or similar to get dimensions - simplified for now
-            return path.suffix[1:].upper()
-
-        return "-"
-
-    def mark_skipped(self, path: Path):
-        """Mark file as skipped"""
-        if path in self.files:
-            old_path = self.get_progress_filename()  # Save before changing status
-            self.files[path].status = "Skipped"
-            self.files[path].time_taken = 0
-            self._update_and_rename(old_path)
-
-    def start_processing(self, path: Path):
-        """Mark file as currently being processed"""
-        if path in self.files:
-            self.files[path].status = "Recoding"
-            self.current_file = path
-            self._write_table()  # Update without rename
-
-    def mark_done(self, path: Path, time_taken: float, new_path: Path, new_params: str = ""):
-        """Mark file as successfully completed"""
-        if path in self.files:
-            old_path = self.get_progress_filename()  # Save before changing status
-            info = describe_file(new_path)
-            self.files[path].status = "Done"
-            self.files[path].time_taken = time_taken
-            self.files[path].new_size = info.get("size") or 0
-            self.files[path].new_params = new_params or self._format_file_params(new_path, info)
-            self.current_file = None
-            self._update_and_rename(old_path)
-
-    def mark_failed(self, path: Path, time_taken: float):
-        """Mark file as failed"""
-        if path in self.files:
-            old_path = self.get_progress_filename()  # Save before changing status
-            self.files[path].status = "Failed"
-            self.files[path].time_taken = time_taken
-            self.current_file = None
-            self._update_and_rename(old_path)
-
-    def _update_and_rename(self, old_path: Path):
-        """Update table and rename file if counters changed"""
-        # Calculate new path based on updated counters
-        new_path = self.get_progress_filename()
-
-        # If filename changed, delete old file first
-        if old_path != new_path and old_path.exists():
-            try:
-                old_path.unlink()
-            except Exception as e:
-                display_error(f"Failed to remove old progress file: {e}")
-
-        # Write table to the (possibly new) path
-        self._write_table()
-
-    def _write_table(self):
-        """Write current state to markdown table"""
-        path = self.get_progress_filename()
-
-        try:
-            with open(path, 'w') as f:
-                # Write header
-                f.write("| Status | Time (s) | Filename | Original Size | New Size | Original Params | New Params |\n")
-                f.write("|--------|----------|----------|---------------|----------|-----------------|------------|\n")
-
-                # Write rows
-                for file_progress in self.files.values():
-                    status = file_progress.status
-                    time_str = f"{file_progress.time_taken:.1f}" if file_progress.time_taken > 0 else "-"
-                    filename = file_progress.path.name
-                    orig_size = self._format_size(file_progress.original_size)
-                    new_size = self._format_size(file_progress.new_size) if file_progress.new_size > 0 else "-"
-                    orig_params = file_progress.original_params or "-"
-                    new_params = file_progress.new_params or "-"
-
-                    f.write(f"| {status} | {time_str} | {filename} | {orig_size} | {new_size} | {orig_params} | {new_params} |\n")
-
-        except Exception as e:
-            display_error(f"Failed to write progress file: {e}")
-
-    def _format_size(self, size_bytes: int) -> str:
-        """Format size in human-readable format"""
-        if size_bytes is None or size_bytes == 0:
-            return "-"
-
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size_bytes < 1024:
-                return f"{size_bytes:.1f} {unit}"
-            size_bytes /= 1024
-        return f"{size_bytes:.1f} TB"
-
-
 def main():
     """
     Main entry point for Automat.
 
-    Progress logging:
-      - Progress is tracked in a markdown table file (only for 'refine' operation).
-      - Filename format: automat-XXXXX-progress-total-done-failed.md
-      - Created at the start with all files as "Pending" status.
-      - Updated on every file completion, and renamed when counters change.
-      - Deleted automatically if no errors occurred.
+    Progress and error logs:
+      - Progress and error logs are only created and updated for long runs (over 3 minutes).
+      - Progress log: .automat-progress.log in the first input's directory.
+      - Error log: .automat-failed.log in the first input's directory.
+      - These files are NOT created at start. They are only created/updated if the run exceeds 3 minutes.
+      - At the end, if these files exist and there were no errors, they are deleted.
     """
-    global _GLOBAL_CONFIG
+    global ENABLE_LOGGING, TRASH_MODE, DEBUG_MODE, DRY_RUN, SUFFIX
     p = argparse.ArgumentParser(
         description=(
             "Automat: refine videos and images using CPU or hardware-accelerated (GPU) encoding.\n\n"
@@ -1719,7 +1129,7 @@ def main():
             "Videos are processed with ffmpeg using CPU encoding by default (better compression, slower).\n"
             "Use --use-gpu to enable hardware-accelerated (videotoolbox) encoding for faster results (less compression).\n"
             "Images are converted to HEIC format using sips for better compression.\n\n"
-            "Progress tracking (refine operation only): automat-XXXXX-progress-total-done-failed.md"
+            "Progress and error logs (.automat-progress.log, .automat-failed.log) are only created for long runs (over 3 minutes) and are always located in the first input's directory."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
@@ -1738,9 +1148,6 @@ def main():
             "  automat.py --amv -a new_track.mp3 video.avi\n\n"
             "  # Use GPU for faster encoding:\n"
             "  automat.py --use-gpu video.mp4\n\n"
-            "  # Check processing status:\n"
-            "  automat.py --status video.mov\n"
-            "  automat.py --status --preset meme video.mov  # Check if will reprocess with meme preset\n\n"
             ""
             "Automator Quick Action Example (macOS):\n"
             "  1. Open Automator and create a new \"Quick Action\".\n"
@@ -1752,7 +1159,7 @@ def main():
             "     - Script:\n"
             "```\n"
             "source $HOME/.zprofile\n"
-            "automat.py --automator -t \"$@\"\n"
+            "automat.py -t \"$@\"\n"
             "```\n"
         )
     )
@@ -1770,10 +1177,6 @@ def main():
                    help="Loop audio to match video duration")
     p.add_argument("--audiofy", action="store_true",
                    help="Extract audio from video as MP3, or create video from image+audio")
-    p.add_argument("--portrait", action="store_true",
-                   help="Generate Baldur's Gate portrait sizes from images")
-    p.add_argument("--status", action="store_true",
-                   help="Check processing status: show metadata and whether file will be reprocessed")
 
     # Quality presets
     p.add_argument("--preset", choices=["meme", "share", "archive"], default="share",
@@ -1786,18 +1189,20 @@ def main():
                    help="Audio file for AMV/audiofy operations")
     p.add_argument("-c", "--codec", choices=["h264", "hevc", "av1"], default="h264",
                    help="Video codec: h264 (most compatible, default), hevc (better compression), av1 (experimental)")
+    p.add_argument("-f", "--format", default=DEFAULT_FORMAT, metavar="FORMAT",
+                   help=f"Output format (mov, mp4, mkv, webm) [default: {DEFAULT_FORMAT}]")
+    p.add_argument("-s", "--suffix", default=SUFFIX,
+                   help=f"Custom suffix for output files [default: {SUFFIX}]")
 
     # Behavior flags
     p.add_argument("--use-gpu", action="store_true",
                    help="Use hardware acceleration (videotoolbox) for faster encoding")
-    p.add_argument("-t", "--trash-originals", action="store_true",
-                   help="Move original files to trash after successful processing")
-    p.add_argument("--log", action="store_true",
-                   help="Enable detailed logging to file")
+    p.add_argument("-t", "--trash", action="store_true",
+                   help="Move original files to trash after processing")
+    p.add_argument("-d", "--debug", action="store_true",
+                   help="Debug mode (extra logging)")
     p.add_argument("-n", "--dry-run", action="store_true",
                    help="Dry-run mode (show what would happen without processing)")
-    p.add_argument("--automator", action="store_true",
-                   help="Automator mode: show notifications for errors and exit 0 (macOS only)")
 
     # File arguments
     p.add_argument("files", nargs="+",
@@ -1809,25 +1214,26 @@ def main():
     if args.amv and not args.audio:
         p.error("--amv requires -a/--audio AUDIO_FILE")
 
+    # Set global flags (for backward compatibility with existing functions)
+    DEBUG_MODE = args.debug
+    TRASH_MODE = args.trash
+    DRY_RUN = args.dry_run
+    SUFFIX = args.suffix
+
     # Build configuration object
     preset = PRESETS[args.preset]
     config = Config(
         preset=preset,
         codec=args.codec,
-        format=DEFAULT_FORMAT,  # Always use mp4 for videos
+        format=args.format,
         use_gpu=args.use_gpu,
-        trash_originals=args.trash_originals,
+        trash=args.trash,
         dry_run=args.dry_run,
         interactive=args.interactive,
+        suffix=args.suffix,
         audio_file=Path(args.audio) if args.audio else None,
-        log=args.log,
-        automator=args.automator,
+        debug=args.debug,
     )
-
-    # Set global config for functions that need it
-    _GLOBAL_CONFIG = config
-
-    install_signal_handlers()
 
     # Check GPU availability
     if config.use_gpu:
@@ -1851,16 +1257,10 @@ def main():
             operations.append("loop_audio")
         if args.audiofy:
             operations.append("audiofy")
-        if args.portrait:
-            operations.append("portrait")
-        if args.status:
-            operations.append("status")
 
-        # Default to refine if no operations specified (unless status)
+        # Default to refine if no operations specified
         if not operations:
             operations.append("refine")
-        if len(operations) > 1:
-            p.error("Only one operation can be specified at a time.")
 
     # First, recursively expand all paths into a flat list of media files
     if not config.interactive:
@@ -1868,7 +1268,8 @@ def main():
     all_files = expand_paths_recursively(args.files)
 
     if not all_files:
-        exit_with_error("No media files found to process")
+        display_error("No media files found to process")
+        return 1
 
     total_files = len(all_files)
 
@@ -1876,11 +1277,10 @@ def main():
     if config.interactive:
         interactive = InteractiveMode()
         operations, config = interactive.run([Path(f) for f in all_files], config)
-        if len(operations) != 1:
-            display_error("Only one operation can be specified at a time.")
-            return 1
-        # Update global config based on interactive config
-        _GLOBAL_CONFIG = config
+        # Update global flags based on interactive config
+        TRASH_MODE = config.trash
+        DRY_RUN = config.dry_run
+        SUFFIX = config.suffix
     elif args.auto and total_files == 1:
         # Auto-detect preset for single file
         media = MediaFile(Path(all_files[0]))
@@ -1888,68 +1288,32 @@ def main():
         print(f"Auto-detected preset: {recommended} ({PRESETS[recommended].description})")
         config.preset = PRESETS[recommended]
 
-    operation = operations[0]
-
-    # Handle status operation separately (read-only)
-    if operation == "status":
-        # Check if output file with -re suffix exists
-        for file_path in all_files:
-            path = Path(file_path)
-
-            print(f"\n{'=' * 70}")
-            print(f"File: {path}")
-            print(f"{'=' * 70}")
-
-            # Determine output extension based on file type
-            if is_video_file(path):
-                ext = config.format
-            elif is_image_file(path):
-                ext = "heic"
-            else:
-                print(f"  Unsupported file type")
-                continue
-
-            refined_path = final_output_path(path, ext, suffix="-re")
-
-            if refined_path.exists():
-                print(f"✓ Refined output exists: {refined_path.name}")
-                orig_size = path.stat().st_size
-                new_size = refined_path.stat().st_size
-                if orig_size > 0:
-                    reduction = (1 - new_size / orig_size) * 100
-                    print(f"  Original:  {orig_size / 1_000_000:.2f} MB")
-                    print(f"  Refined:   {new_size / 1_000_000:.2f} MB")
-                    print(f"  Reduction: {reduction:.1f}%")
-                print(f"\n✓ WILL SKIP (refined output already exists)")
-            else:
-                print(f"✗ No refined output found")
-                print(f"  Expected: {refined_path.name}")
-                print(f"\n⚠ WILL PROCESS")
-
-        return 0
-
     if not config.interactive:
         display_info(f"Found {total_files} media files to process")
 
-    # Generate session code for this run
-    global _SESSION_CODE
-    _SESSION_CODE = secrets.token_hex(3)  # 6-character hex code
-
-    # Set up logging
+    # Set up progress, error, and raw log tracking
     base_path = get_base_path(args.files)
+    progress_file = base_path / ".automat-progress.log"
+    error_file = base_path / ".automat-failed.log"
+    raw_log_file = base_path / ".automat-raw.log"
 
-    # Setup raw logging only if --log is enabled
-    if config.log:
-        raw_log_file = base_path / f"automat-{_SESSION_CODE}-raw.log"
-        setup_logging(str(raw_log_file), debug=True)
-    else:
-        setup_logging(None, debug=False)
+    # Remove existing log files to start fresh (only if they exist)
+    if not DRY_RUN:
+        for f in (progress_file, error_file, raw_log_file):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    display_error(f"Failed to remove existing log file {f}: {e}")
+        # Create empty progress and error log files at start
+        try:
+            progress_file.touch()
+            error_file.touch()
+        except Exception as e:
+            display_error(f"Failed to create log files: {e}")
 
-    # Initialize progress tracker (only for refine operation)
-    tracker = None
-    if operation == "refine":
-        tracker = ProgressTracker(base_path, _SESSION_CODE)
-        tracker.initialize([Path(f) for f in all_files])
+    # Always log to RAW_LOG_FILE in the base_path
+    setup_logging(str(raw_log_file))
 
     processed = 0
     failed = 0
@@ -1959,49 +1323,38 @@ def main():
 
     # Process each file
     for file_path in all_files:
-        file_start = time.time()
         n = processed + skipped + failed + 1
         print(f"{n}/{total_files}: {file_path}", flush=True)
-
-        path = Path(file_path)
-
-        if is_already_processed(file_path, operation, config):
+        if is_already_processed(file_path):
             print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
             skipped += 1
-            if tracker:
-                tracker.mark_skipped(path)
+            update_progress_file(progress_file, total_files, processed, skipped, failed)
             continue
-
-        if tracker:
-            tracker.start_processing(path)
-
-        ok = process_single_file(file_path, operation, config)
-        elapsed = time.time() - file_start
-
+        ok = process_single_file(file_path, operations, config.audio_file, config.codec, config.format, is_cpu=not config.use_gpu)
         if ok:
             processed += 1
-            if tracker:
-                # Get new file path (with -re suffix for refine)
-                new_path = final_output_path(path, config.format, suffix="-re")
-                tracker.mark_done(path, elapsed, new_path)
         else:
             print(f"{color_tag('[Failed]', COLOR_RED)} {file_path}", file=sys.stderr, flush=True)
             failed += 1
-            if tracker:
-                tracker.mark_failed(path, elapsed)
+            log_error_file(error_file, file_path)
+        update_progress_file(progress_file, total_files, processed, skipped, failed)
 
     # Print summary to raw log (not stdout)
     display_info(f"Processing complete. Success: {processed}, Skipped: {skipped}, Failed: {failed}")
 
     # Show notification when complete
-    if not config.dry_run and total_files > 1:
+    if not DRY_RUN and total_files > 1:
         notify("Automat", f"Processed {processed} files, {failed} failed")
 
-    # Progress and log files are kept for user review - no automatic cleanup
+    # If there were no errors, delete all three log files
+    if not DRY_RUN and failed == 0:
+        for f in (progress_file, error_file, raw_log_file):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception as e:
+                    display_error(f"Failed to remove log file {f}: {e}")
 
-    # In automator mode, always return 0 to avoid modal error dialogs
-    if config.automator:
-        return 0
     return 0 if failed == 0 else 1
 
 if __name__ == "__main__":
