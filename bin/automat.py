@@ -38,10 +38,10 @@ import json
 import shutil
 import os
 import time
+import uuid
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-from abc import ABC, abstractmethod
 
 # ============================================================================
 # CONFIGURATION & PRESETS
@@ -77,14 +77,11 @@ class Config:
     audio_file: Optional[Path] = None
     debug: bool = False
 
-# Global settings (to be deprecated in favor of Config)
-RAW_LOG_FILE = ".automat-raw.log"
+# Global state (set from args in main())
 TRASH_MODE = False
 DEBUG_MODE = False
 DRY_RUN = False
 SUFFIX = "-re"
-DEFAULT_CODEC = "h264"
-DEFAULT_FORMAT = "mov"
 
 # ANSI colors for stderr tags
 COLOR_RESET = "\x1b[0m"
@@ -190,15 +187,19 @@ class MediaFile:
 # ============================================================================
 # UTILITY FUNCTIONS (Logging, Display, Commands)
 # ============================================================================
-#
-# NOTE: The quality/CRF logic is now in CodecStrategy classes (see CODEC STRATEGIES section)
-#       Presets are defined above in PRESETS dict
-#
-DEFAULT_PRESET = "slow"  # encoding speed vs compression efficiency
-DEFAULT_CRF_H264 = 24    # Legacy - now defined in Preset dataclass
-DEFAULT_CRF_HEVC = 29    # Legacy - now defined in Preset dataclass
 
 logger = logging.getLogger(__name__)
+
+def check_dependencies():
+    """Check that required external tools are available"""
+    missing = []
+    for tool in ["ffmpeg", "ffprobe", "sips"]:
+        if shutil.which(tool) is None:
+            missing.append(tool)
+    if missing:
+        display_error(f"Required tools not found: {', '.join(missing)}")
+        display_error("Please install missing tools (e.g., brew install ffmpeg)")
+        sys.exit(1)
 
 def setup_logging(log_path=None):
     logger.handlers = []            # Remove any existing handlers
@@ -254,15 +255,14 @@ def move_to_trash(path):
         display_info(f"[DRY RUN] Would move to trash: {path}")
         return
 
-    path = Path(path)
+    path = Path(path).resolve()
     if not path.exists():
         logger.error("File not found for trashing: %s", path)
         return
-    script = f'''
-    tell application "Finder"
-        move POSIX file "{path.as_posix()}" to trash
-    end tell
-    '''
+
+    # Escape quotes in path for AppleScript safety
+    safe_path = str(path).replace('\\', '\\\\').replace('"', '\\"')
+    script = f'tell application "Finder" to delete POSIX file "{safe_path}"'
     res = run_command(["osascript", "-e", script])
     if res.returncode == 0:
         logger.info(f"Moved to trash: {path}")
@@ -306,89 +306,6 @@ def calculate_optimal_bitrate(w, h, curr, size, dur):
     chosen = round(chosen/100_000)*100_000
     logger.info(f"Optimal bitrate: {chosen}")
     return chosen
-
-# ============================================================================
-# CODEC STRATEGIES
-# ============================================================================
-
-class CodecStrategy(ABC):
-    """Base class for codec-specific encoding strategies"""
-
-    @abstractmethod
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        """Build codec-specific ffmpeg video options string"""
-        pass
-
-    def get_crf_for_quality(self, base_crf: int, video_info: VideoInfo) -> int:
-        """Adjust CRF based on source video bitrate (more aggressive for already-compressed)"""
-        if video_info.is_low_bitrate:
-            return base_crf + 4  # More aggressive compression
-        return base_crf
-
-    def get_dynamic_bitrate(self, video_info: VideoInfo) -> int:
-        """Calculate dynamic bitrate for GPU encoding"""
-        min_gpu_bitrate = 600_000 if video_info.is_hd else 450_000
-        gpu_bitrate_thresh = 4_000_000 if video_info.is_hd else 2_500_000
-
-        src_bitrate = video_info.bitrate if video_info.bitrate > 0 else gpu_bitrate_thresh
-
-        if src_bitrate < 1_000_000:
-            return max(int(src_bitrate * 0.85), min_gpu_bitrate)
-        else:
-            if src_bitrate > gpu_bitrate_thresh:
-                chosen = int(max(0.8 * src_bitrate, gpu_bitrate_thresh))
-                dynamic_bitrate = min(src_bitrate, chosen)
-            else:
-                dynamic_bitrate = src_bitrate
-            if dynamic_bitrate < min_gpu_bitrate:
-                dynamic_bitrate = min_gpu_bitrate
-            return dynamic_bitrate
-
-class H264CPUStrategy(CodecStrategy):
-    """H.264 CPU encoding with libx264"""
-
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        crf = self.get_crf_for_quality(config.preset.h264_crf, video_info)
-        return f"-c:v libx264 -preset slow -crf {crf}"
-
-class H264GPUStrategy(CodecStrategy):
-    """H.264 GPU encoding with videotoolbox"""
-
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        bitrate = self.get_dynamic_bitrate(video_info)
-        bval = f"{int(bitrate // 1000)}k"
-        return f"-c:v h264_videotoolbox -b:v {bval} -tag:v avc1"
-
-class HEVCCPUStrategy(CodecStrategy):
-    """HEVC/H.265 CPU encoding with libx265"""
-
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        crf = self.get_crf_for_quality(config.preset.hevc_crf, video_info)
-        return f'-c:v libx265 -preset slow -crf {crf} -tag:v hvc1 -x265-params "psy-rd=2.0:psy-rdoq=1.0:aq-mode=3:aq-strength=1.0:ref=5:bframes=8:rc-lookahead=60"'
-
-class HEVCGPUStrategy(CodecStrategy):
-    """HEVC/H.265 GPU encoding with videotoolbox"""
-
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        bitrate = self.get_dynamic_bitrate(video_info)
-        bval = f"{int(bitrate // 1000)}k"
-        return f"-c:v hevc_videotoolbox -b:v {bval} -tag:v hvc1"
-
-class AV1Strategy(CodecStrategy):
-    """AV1 encoding with libaom-av1 (experimental)"""
-
-    def build_video_options(self, config: Config, video_info: VideoInfo) -> str:
-        return "-c:v libaom-av1 -crf 30 -b:v 0 -strict experimental"
-
-# Codec strategy registry
-CODEC_REGISTRY = {
-    ("h264", True): H264CPUStrategy(),
-    ("h264", False): H264GPUStrategy(),
-    ("hevc", True): HEVCCPUStrategy(),
-    ("hevc", False): HEVCGPUStrategy(),
-    ("av1", True): AV1Strategy(),
-    ("av1", False): AV1Strategy(),  # AV1 doesn't have GPU variant yet
-}
 
 def is_videotoolbox_available():
     """Check if videotoolbox hardware encoder is available via ffmpeg."""
@@ -458,60 +375,8 @@ def build_ffmpeg_command(src, codec, fmt, is_cpu=None, crf_value=None, dynamic_b
     return cmd, out
 
 # ============================================================================
-# OPERATIONS BASE CLASS
+# VIDEO/IMAGE PROCESSING FUNCTIONS
 # ============================================================================
-
-@dataclass
-class Result:
-    """Result of a processing operation"""
-    success: bool
-    original_size: int = 0
-    new_size: int = 0
-    output_path: Optional[Path] = None
-
-    @property
-    def size_reduction_pct(self) -> float:
-        """Calculate size reduction percentage"""
-        if self.original_size > 0:
-            return (1 - self.new_size / self.original_size) * 100
-        return 0.0
-
-    @property
-    def original_size_mb(self) -> float:
-        """Original size in MB"""
-        return self.original_size / 1_000_000
-
-    @property
-    def new_size_mb(self) -> float:
-        """New size in MB"""
-        return self.new_size / 1_000_000
-
-class Operation(ABC):
-    """Base class for all media processing operations"""
-
-    @abstractmethod
-    def supports(self, media: MediaFile) -> bool:
-        """Check if this operation supports the given media file"""
-        pass
-
-    @abstractmethod
-    def execute(self, media: MediaFile, config: Config) -> Result:
-        """Execute the operation on the media file"""
-        pass
-
-    def _validate_ffmpeg_output(self, output: Path, dry_run: bool = False) -> bool:
-        """Common validation logic for FFmpeg outputs"""
-        if dry_run:
-            return True
-        if not output.is_file() or output.stat().st_size == 0:
-            display_error(f"Output missing or empty: {output}")
-            return False
-        return True
-
-    def _cleanup_source(self, media: MediaFile, config: Config):
-        """Common cleanup logic - move to trash if requested"""
-        if config.trash and not config.dry_run:
-            move_to_trash(media.path)
 
 def process_video_refine(src, codec, fmt, is_cpu=None):
     """
@@ -881,7 +746,6 @@ def process_image_audiofy(src, audio_track, codec, fmt):
     Given an image and an audio track, create a video of the image with the audio.
     If audio_track is a video, extract its audio stream first.
     """
-    import uuid
     src = Path(src)
     audio_track = Path(audio_track)
     tmp_audio = None
@@ -1256,6 +1120,8 @@ def main():
     # Mode selection
     p.add_argument("-i", "--interactive", action="store_true",
                    help="Interactive mode with guided prompts for operations")
+    p.add_argument("--list-presets", action="store_true",
+                   help="Show available quality presets and exit")
 
     # Operation flags
     p.add_argument("--refine", action="store_true",
@@ -1280,8 +1146,8 @@ def main():
                    help="Audio file for AMV/audiofy operations")
     p.add_argument("-c", "--codec", choices=["h264", "hevc", "av1"], default="h264",
                    help="Video codec: h264 (most compatible, default), hevc (better compression), av1 (experimental)")
-    p.add_argument("-f", "--format", default=DEFAULT_FORMAT, metavar="FORMAT",
-                   help=f"Output format (mov, mp4, mkv, webm) [default: {DEFAULT_FORMAT}]")
+    p.add_argument("-f", "--format", default="mov", metavar="FORMAT",
+                   help="Output format (mov, mp4, mkv, webm) [default: mov]")
     p.add_argument("-s", "--suffix", default=SUFFIX,
                    help=f"Custom suffix for output files [default: {SUFFIX}]")
 
@@ -1296,10 +1162,29 @@ def main():
                    help="Dry-run mode (show what would happen without processing)")
 
     # File arguments
-    p.add_argument("files", nargs="+",
+    p.add_argument("files", nargs="*",
                    help="Files or directories to process")
 
     args = p.parse_args()
+
+    # Handle --list-presets
+    if args.list_presets:
+        print("Available quality presets:\n")
+        for name, preset in PRESETS.items():
+            print(f"  {name:8} - {preset.description}")
+            print(f"             H.264 CRF: {preset.h264_crf}, HEVC CRF: {preset.hevc_crf}")
+            max_res = f"{preset.max_resolution}p" if preset.max_resolution else "unlimited"
+            print(f"             Max resolution: {max_res}")
+            print(f"             Audio bitrate: {preset.audio_bitrate}")
+            print()
+        return 0
+
+    # Require files if not listing presets
+    if not args.files:
+        p.error("the following arguments are required: files")
+
+    # Check dependencies early
+    check_dependencies()
 
     # Validate argument dependencies
     if args.amv and not args.audio:
