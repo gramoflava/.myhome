@@ -733,6 +733,90 @@ def process_image(src):
         move_to_trash(src)
     return True
 
+# Portrait sizes for Baldur's Gate: (suffix, width, height)
+PORTRAIT_SIZES = [
+    ("L", 420, 660),
+    ("M", 338, 532),
+    ("S", 108, 168),
+]
+
+def process_portraits(src):
+    """
+    Generate Baldur's Gate portrait images from source image.
+    Creates L/M/S sized BMPs in a Portraits/ subfolder next to the source.
+    """
+    src = Path(src)
+
+    # Create Portraits directory next to source
+    portraits_dir = src.parent / "Portraits"
+    if not DRY_RUN:
+        portraits_dir.mkdir(exist_ok=True)
+
+    success = True
+
+    for suffix, target_width, target_height in PORTRAIT_SIZES:
+        output_path = portraits_dir / f"{src.stem}{suffix}.bmp"
+
+        if DRY_RUN:
+            display_info(f"[DRY RUN] Would create portrait: {output_path}")
+            continue
+
+        # Create a temp file for intermediate processing
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        try:
+            # Step 1: Copy source to temp file (sips modifies in place)
+            shutil.copy2(src, tmp_path)
+
+            # Step 2: Resample to target height (maintains aspect ratio)
+            cmd_resample = ["sips", "--resampleHeight", str(target_height), str(tmp_path)]
+            logger.info("Running: " + " ".join(cmd_resample))
+            res = run_command(cmd_resample)
+            if res.returncode != 0:
+                display_error(f"sips resampleHeight failed for {suffix}: {res.stderr}")
+                success = False
+                continue
+
+            # Step 3: Center-crop to exact dimensions
+            cmd_crop = ["sips", "--cropToHeightWidth", str(target_height), str(target_width), str(tmp_path)]
+            logger.info("Running: " + " ".join(cmd_crop))
+            res = run_command(cmd_crop)
+            if res.returncode != 0:
+                display_error(f"sips cropToHeightWidth failed for {suffix}: {res.stderr}")
+                success = False
+                continue
+
+            # Step 4: Convert to 24-bit BMP using ffmpeg
+            cmd_convert = [
+                "ffmpeg", "-y", "-i", str(tmp_path),
+                "-vf", "format=bgr24",
+                str(output_path)
+            ]
+            logger.info("Running: " + " ".join(cmd_convert))
+            res = run_command(cmd_convert)
+            if res.returncode != 0:
+                display_error(f"ffmpeg BMP conversion failed for {suffix}: {res.stderr}")
+                success = False
+                continue
+
+            if not output_path.is_file() or output_path.stat().st_size == 0:
+                display_error(f"Portrait output missing or empty: {output_path}")
+                success = False
+                continue
+
+            display_info(f"Created portrait: {output_path}")
+
+        finally:
+            # Clean up temp file
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to clean up temp file: {tmp_path} ({e})")
+
+    return success
+
 def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=None):
     """Process a single file with the specified operations"""
     file_path = Path(file_path)
@@ -745,8 +829,8 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
         display_error(f"File not found: {file_path}")
         return False
 
-    # Skip if already processed
-    if is_already_processed(file_path):
+    # Skip if already processed (but not for portraits operation which doesn't use suffix detection)
+    if "portraits" not in operations and is_already_processed(file_path):
         display_info(f"Skipping already processed file: {file_path}")
         return True
 
@@ -770,6 +854,8 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
             elif operation == "audiofy":
                 if not process_video_audiofy(file_path, codec, fmt):
                     success = False
+            elif operation == "portraits":
+                display_info(f"Skipping video for portraits (images only): {file_path}")
 
     elif is_image_file(file_path):
         display_info(f"Processing image: {file_path}")
@@ -777,11 +863,14 @@ def process_single_file(file_path, operations, audio_track, codec, fmt, is_cpu=N
             if operation == "refine":
                 if not process_image(file_path):
                     success = False
+            elif operation == "portraits":
+                if not process_portraits(file_path):
+                    success = False
             elif operation == "audiofy" and audio_track:
                 if not process_image_audiofy(file_path, audio_track, codec, fmt):
                     success = False
             else:
-                if operation not in ("refine", "audiofy"):
+                if operation not in ("refine", "audiofy", "portraits"):
                     display_info(f"Skipping image (no supported operations): {file_path}")
     else:
         display_error(f"Unsupported file type: {file_path}")
@@ -1177,6 +1266,8 @@ def main():
                    help="Loop audio to match video duration")
     p.add_argument("--audiofy", action="store_true",
                    help="Extract audio from video as MP3, or create video from image+audio")
+    p.add_argument("--portraits", action="store_true",
+                   help="Generate Baldur's Gate portrait images (L/M/S sizes) from source images")
 
     # Quality presets
     p.add_argument("--preset", choices=["meme", "share", "archive"], default="share",
@@ -1257,6 +1348,8 @@ def main():
             operations.append("loop_audio")
         if args.audiofy:
             operations.append("audiofy")
+        if args.portraits:
+            operations.append("portraits")
 
         # Default to refine if no operations specified
         if not operations:
@@ -1325,7 +1418,8 @@ def main():
     for file_path in all_files:
         n = processed + skipped + failed + 1
         print(f"{n}/{total_files}: {file_path}", flush=True)
-        if is_already_processed(file_path):
+        # Skip suffix-based detection unless portraits operation (which doesn't use it)
+        if "portraits" not in operations and is_already_processed(file_path):
             print(f"{color_tag('[Skipped]', COLOR_YELLOW)} {file_path}", file=sys.stderr, flush=True)
             skipped += 1
             update_progress_file(progress_file, total_files, processed, skipped, failed)
