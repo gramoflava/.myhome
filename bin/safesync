@@ -52,7 +52,6 @@ Options:
     -n, --dry-run          Show what would be transferred without doing it
     --no-delete            Keep extra files in DEST (default: delete for exact mirror)
     --no-checksum          Skip checksum verification (faster, less safe)
-    --no-match-owner       Don't match destination owner (default: match for local)
     --preserve-times       Preserve modification times (default: disabled)
     -v, --verbose          Show detailed transfer information
     -h, --help             Show this help message
@@ -76,12 +75,6 @@ Examples:
     # Keep extra files on destination (don't delete)
     safesync --no-delete ~/source/ ~/destination/
 
-    # Copy to docker directory (automatically matches owner, needs sudo)
-    sudo safesync ~/models/ /var/lib/docker/volumes/data/
-
-    # Disable owner matching
-    safesync --no-match-owner ~/source/ /destination/
-
 Notes:
     • Trailing slash matters: "SRC/" copies contents, "SRC" creates subdirectory
     • Requires rsync 3.1.0+ (use Homebrew on macOS, not built-in 2.6.9)
@@ -97,8 +90,7 @@ SSH_PORT="${RSYNC_SSH_PORT:-22}"
 DRY_RUN=0
 DELETE=1  # Default: delete for exact mirror
 USE_CHECKSUM=1
-MATCH_OWNER=1  # Default: match owner for local transfers
-PRESERVE_TIMES=0  # Default: don't preserve times (avoids permission errors)
+PRESERVE_TIMES=0
 VERBOSE=0
 SOURCE=""
 DESTINATION=""
@@ -127,10 +119,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-checksum)
             USE_CHECKSUM=0
-            shift
-            ;;
-        --no-match-owner)
-            MATCH_OWNER=0
             shift
             ;;
         --preserve-times)
@@ -194,45 +182,15 @@ if [[ "$SOURCE" == *:* && ! "$SOURCE" =~ ^[A-Za-z]:[/\\] ]] || \
     IS_REMOTE=1
 fi
 
-# Get destination owner if --match-owner is set
-CHOWN_ARG=""
-if [[ $MATCH_OWNER -eq 1 ]]; then
-    if [[ $IS_REMOTE -eq 1 ]]; then
-        print_warning "--match-owner only works for local destinations, ignoring"
-    else
-        # Extract base directory (remove trailing slash)
-        DEST_DIR="${DESTINATION%/}"
-
-        # Check if destination exists
-        if [[ -d "$DEST_DIR" ]]; then
-            # Get owner:group using stat
-            if [[ "$OSTYPE" == darwin* ]]; then
-                # macOS stat format
-                DEST_OWNER=$(stat -f "%u:%g" "$DEST_DIR" 2>/dev/null)
-            else
-                # Linux stat format
-                DEST_OWNER=$(stat -c "%u:%g" "$DEST_DIR" 2>/dev/null)
-            fi
-
-            if [[ -n "$DEST_OWNER" ]]; then
-                CHOWN_ARG="$DEST_OWNER"
-                print_info "Will set ownership to $DEST_OWNER (from destination directory)"
-            else
-                print_warning "Could not determine destination owner, skipping --match-owner"
-            fi
-        else
-            print_warning "Destination does not exist yet, cannot match owner"
-        fi
-    fi
-fi
-
 # Build rsync command
+# Minimal flags for reliable sync without permission headaches
 RSYNC_OPTS=(
-    -avh
-    --info=progress2
-    --partial
-    --inplace
-    --mkpath
+    -rlDh                 # recursive, links, devices, human-readable (no perms/owner/group)
+    --info=progress2      # Modern progress indicator
+    --stats               # Show transfer statistics at end
+    --partial             # Keep partially transferred files for resume
+    --inplace             # Update files in place (better for large files)
+    --mkpath              # Create destination path if missing
 )
 
 if [[ $IS_REMOTE -eq 1 ]]; then
@@ -244,12 +202,8 @@ if [[ $USE_CHECKSUM -eq 1 ]]; then
     RSYNC_OPTS+=(-c)
 fi
 
-if [[ $PRESERVE_TIMES -eq 0 ]]; then
-    RSYNC_OPTS+=(--no-times)
-fi
-
-if [[ -n "$CHOWN_ARG" ]]; then
-    RSYNC_OPTS+=(--chown="$CHOWN_ARG")
+if [[ $PRESERVE_TIMES -eq 1 ]]; then
+    RSYNC_OPTS+=(-t)  # Add times preservation only when requested
 fi
 
 if [[ $DRY_RUN -eq 1 ]]; then
@@ -264,7 +218,7 @@ else
 fi
 
 if [[ $VERBOSE -eq 1 ]]; then
-    RSYNC_OPTS+=(--progress)
+    RSYNC_OPTS+=(--itemize-changes)  # Show what changed for each file
 fi
 
 # Show transfer summary
@@ -282,7 +236,8 @@ echo >&2
 
 # Execute rsync and capture output to check for permission-only errors
 RSYNC_OUTPUT=$(mktemp)
-trap "rm -f '$RSYNC_OUTPUT'" EXIT
+cleanup() { rm -f "$RSYNC_OUTPUT"; }
+trap cleanup EXIT
 
 rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DESTINATION" 2>&1 | tee "$RSYNC_OUTPUT"
 EXIT_CODE=${pipestatus[1]}
