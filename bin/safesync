@@ -24,7 +24,8 @@ FEATURES:
         × deleted (removed from destination)
         ! error (transfer failed)
     - Real-time progress bar with file count
-    - Pre-scan shows all files before transfer begins
+    - Transfer speed and volume display (updated during large file transfers)
+    - Pre-scan shows all files with total size before transfer begins
     - Final summary with statistics
 
 COMPARISON MODES:
@@ -39,6 +40,7 @@ import sys
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -82,6 +84,16 @@ class Term:
 def is_tty() -> bool:
     """Check if stdout is a terminal"""
     return sys.stdout.isatty()
+
+def format_bytes(n: int) -> str:
+    """Format bytes as human-readable string"""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if abs(n) < 1024:
+            if unit == 'B':
+                return f"{n}{unit}"
+            return f"{n:.1f}{unit}"
+        n /= 1024
+    return f"{n:.1f}PB"
 
 def color(text: str, c: str) -> str:
     """Apply color if terminal supports it"""
@@ -150,6 +162,11 @@ class SyncStats:
     deleted: int = 0
     errors: int = 0
     bytes_transferred: int = 0
+    bytes_total: int = 0
+    current_speed: str = ""      # e.g., "45.3MB/s"
+    current_file_bytes: int = 0  # Bytes transferred of current file
+    current_file_total: int = 0  # Total bytes of current file
+    current_file_pct: int = 0    # Percentage of current file
 
 # ============================================================================
 # RSYNC OUTPUT PARSING
@@ -271,10 +288,11 @@ class ProgressDisplay:
         print(color("Scanning files...", Term.BLUE))
         sys.stdout.flush()
 
-    def set_files(self, files: list[FileEntry]):
+    def set_files(self, files: list[FileEntry], total_bytes: int = 0):
         """Set the file list and print initial state"""
         self.files = files
         self.stats.total_files = len([f for f in files if not f.is_delete])
+        self.stats.bytes_total = total_bytes
 
         # Clear scanning message and print file list
         if self.use_fancy:
@@ -290,7 +308,10 @@ class ProgressDisplay:
 
         summary_parts = []
         if to_transfer:
-            summary_parts.append(f"{len(to_transfer)} to transfer")
+            if total_bytes > 0:
+                summary_parts.append(f"{len(to_transfer)} to transfer ({format_bytes(total_bytes)})")
+            else:
+                summary_parts.append(f"{len(to_transfer)} to transfer")
         if to_delete:
             summary_parts.append(f"{len(to_delete)} to delete")
 
@@ -308,10 +329,10 @@ class ProgressDisplay:
             remaining = len(files) - self.max_display
             print(color(f"  ... and {remaining} more files", Term.DIM))
 
-        # Progress line (will be updated)
+        # Progress line (cursor stays here for updates)
         print()
         self._print_progress_line()
-        print()
+        # Don't print newline - cursor stays on progress line for in-place updates
         self.initialized = True
         self.progress_line_shown = True
         sys.stdout.flush()
@@ -323,25 +344,40 @@ class ProgressDisplay:
         pct = int(done / total * 100) if total > 0 else 0
 
         # Create progress bar
-        bar_width = 30
+        bar_width = 20
         filled = int(bar_width * done / total) if total > 0 else 0
         bar = "█" * filled + "░" * (bar_width - filled)
 
-        line = f"  [{bar}] {done}/{total} ({pct}%)"
+        # Build line components
+        parts = [f"[{bar}] {done}/{total}"]
+
+        # Add bytes transferred/total if we have that info
+        if self.stats.bytes_total > 0:
+            bytes_done = self.stats.bytes_transferred + self.stats.current_file_bytes
+            parts.append(f"{format_bytes(bytes_done)}/{format_bytes(self.stats.bytes_total)}")
+        elif self.stats.bytes_transferred > 0:
+            parts.append(format_bytes(self.stats.bytes_transferred))
+
+        # Add current speed if available
+        if self.stats.current_speed:
+            parts.append(self.stats.current_speed)
+
+        # Add current file progress if transferring a large file
+        if self.stats.current_file_pct > 0 and self.stats.current_file_pct < 100:
+            parts.append(f"file: {self.stats.current_file_pct}%")
+
+        line = "  " + " | ".join(parts)
         print(color(line, Term.CYAN), end="")
         sys.stdout.flush()
 
     def _update_progress(self):
-        """Update the progress line in place"""
+        """Update the progress line in place (cursor should be on this line)"""
         if not self.use_fancy or not self.progress_line_shown:
             return
 
-        # Move to progress line (1 line up from current position)
-        sys.stdout.write(Term.SAVE_POS)
-        sys.stdout.write(Term.move_up(1))
+        # Simple approach: cursor is on progress line, just overwrite
         sys.stdout.write("\r" + Term.CLEAR_LINE)
         self._print_progress_line()
-        sys.stdout.write(Term.RESTORE_POS)
         sys.stdout.flush()
 
     def update_file(self, path: str, status: FileStatus):
@@ -359,9 +395,8 @@ class ProgressDisplay:
                 elif status == FileStatus.ERROR:
                     self.stats.errors += 1
 
-                # Update display if file is visible
-                if self.use_fancy and i < self.max_display and self.initialized:
-                    self._update_line(i, f)
+                # Note: Disabled fancy file line updates - unreliable over SSH
+                # The progress bar still updates in real-time
 
                 # Update progress bar
                 if status in (FileStatus.DONE, FileStatus.ERROR):
@@ -395,8 +430,24 @@ class ProgressDisplay:
         """Mark a file as currently being copied"""
         self.update_file(path, FileStatus.COPYING)
 
+    def update_transfer_progress(self, bytes_done: int, pct: int, speed: str):
+        """Update current file transfer progress"""
+        self.stats.current_file_bytes = bytes_done
+        self.stats.current_file_pct = pct
+        if speed:
+            self.stats.current_speed = speed
+        self._update_progress()
+
     def mark_done(self, path: str):
         """Mark a file as successfully transferred"""
+        # Add current file bytes to total transferred
+        for f in self.files:
+            if f.path == path and not f.is_delete:
+                self.stats.bytes_transferred += f.size
+                break
+        # Reset current file progress
+        self.stats.current_file_bytes = 0
+        self.stats.current_file_pct = 0
         self.update_file(path, FileStatus.DONE)
 
     def mark_deleted(self, path: str):
@@ -421,7 +472,10 @@ class ProgressDisplay:
         print("Summary:")
 
         if self.stats.transferred > 0:
-            print(f"  {color('✓', Term.GREEN)} {self.stats.transferred} file(s) transferred")
+            transferred_str = f"{self.stats.transferred} file(s) transferred"
+            if self.stats.bytes_transferred > 0:
+                transferred_str += f" ({format_bytes(self.stats.bytes_transferred)})"
+            print(f"  {color('✓', Term.GREEN)} {transferred_str}")
 
         if self.stats.deleted > 0:
             print(f"  {color('×', Term.RED)} {self.stats.deleted} file(s) deleted")
@@ -458,7 +512,7 @@ def check_rsync() -> bool:
 
     return True
 
-def build_rsync_opts(config: dict) -> list[str]:
+def build_rsync_opts(config: dict, for_scan: bool = False) -> list[str]:
     """Build rsync command options"""
     opts = [
         "-rlDht",         # recursive, links, devices, human-readable, times (no perms/owner)
@@ -467,6 +521,10 @@ def build_rsync_opts(config: dict) -> list[str]:
         "--mkpath",       # Create destination if missing
         "--itemize-changes",  # Show what changed (for parsing)
     ]
+
+    # Add progress output for real transfers (not scanning)
+    if not for_scan:
+        opts.append("--progress")  # Show per-file progress with speed
 
     # Remote transfer options
     if config.get('is_remote'):
@@ -494,41 +552,119 @@ def build_rsync_opts(config: dict) -> list[str]:
 
     return opts
 
-def scan_files(config: dict) -> list[FileEntry]:
+def scan_files(config: dict) -> tuple[list[FileEntry], int]:
     """
     Scan source and destination to determine what will be transferred.
     Uses rsync --dry-run --itemize-changes to get the file list.
+    Returns: (list of FileEntry, total bytes to transfer)
     """
-    opts = build_rsync_opts(config)
+    opts = build_rsync_opts(config, for_scan=True)
 
     # Force dry-run for scanning
     if "--dry-run" not in opts:
         opts.append("--dry-run")
+
+    # Add output format to include file size: itemize TAB size TAB path
+    opts.append("--out-format=%i\t%l\t%n")
 
     cmd = ["rsync"] + opts + [config['source'], config['dest']]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
     files = []
-    for line in result.stdout.splitlines():
-        path, reason, is_delete = parse_itemize(line)
-        if path and not path.endswith('/'):  # Skip directories
-            entry = FileEntry(
-                path=path,
-                reason=reason,
-                is_delete=is_delete,
-                status=FileStatus.DELETED if is_delete else FileStatus.PENDING
-            )
-            files.append(entry)
+    total_bytes = 0
 
-    return files
+    for line in result.stdout.splitlines():
+        # Skip informational messages (e.g., "created directory ...")
+        if line.startswith("created ") or line.startswith("sending ") or line.startswith("receiving "):
+            continue
+
+        # Try to parse the extended format with size (tab-separated)
+        parts = line.split('\t')
+        if len(parts) >= 3:
+            itemize_part = parts[0]
+            try:
+                size = int(parts[1])
+            except ValueError:
+                size = 0
+            path = parts[2]
+
+            # Skip directories (path ends with / or is ./)
+            if path.endswith('/') or path == './':
+                continue
+
+            # Parse the itemize portion
+            _, reason, is_delete = parse_itemize(itemize_part + " " + path)
+
+            # Only include if we got a valid reason
+            if reason:
+                entry = FileEntry(
+                    path=path,
+                    reason=reason,
+                    is_delete=is_delete,
+                    size=size,
+                    status=FileStatus.DELETED if is_delete else FileStatus.PENDING
+                )
+                files.append(entry)
+                if not is_delete:
+                    total_bytes += size
+        else:
+            # Fallback to old parsing (for lines without tabs)
+            # Only if line looks like itemize format (starts with valid flags)
+            if len(line) >= 12 and line[0] in '<>ch*':
+                path, reason, is_delete = parse_itemize(line)
+                if path and not path.endswith('/') and reason:
+                    entry = FileEntry(
+                        path=path,
+                        reason=reason,
+                        is_delete=is_delete,
+                        status=FileStatus.DELETED if is_delete else FileStatus.PENDING
+                    )
+                    files.append(entry)
+
+    return files, total_bytes
+
+def parse_size_string(s: str) -> int:
+    """Parse size string like '32.77K', '5.24M', '1,234,567' to bytes"""
+    s = s.strip().replace(',', '')
+    multipliers = {'K': 1024, 'M': 1024**2, 'G': 1024**3, 'T': 1024**4}
+
+    if s and s[-1] in multipliers:
+        try:
+            return int(float(s[:-1]) * multipliers[s[-1]])
+        except ValueError:
+            return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def parse_progress_line(line: str) -> tuple[int, int, str]:
+    """
+    Parse rsync --progress output line.
+    Formats:
+        "     1,234,567  45%   12.34MB/s    0:00:05"
+        "        32.77K   0%    0.00kB/s    0:00:00"
+        "         5.24M 100%  828.12MB/s    0:00:00 (xfr#1, to-chk=1/3)"
+    Returns: (bytes_done, percentage, speed) or (0, 0, "") if not a progress line
+    """
+    # Match progress format: size (with optional K/M/G suffix), percentage, speed
+    match = re.match(r'\s*([\d,.]+[KMGT]?)\s+(\d+)%\s+([\d.]+[kMG]?B/s)', line)
+    if match:
+        bytes_done = parse_size_string(match.group(1))
+        pct = int(match.group(2))
+        speed = match.group(3)
+        return (bytes_done, pct, speed)
+    return (0, 0, "")
+
 
 def run_sync(config: dict, display: ProgressDisplay) -> int:
     """
     Execute the actual rsync transfer with progress tracking.
     Returns exit code.
     """
-    opts = build_rsync_opts(config)
+    opts = build_rsync_opts(config, for_scan=False)
     cmd = ["rsync"] + opts + [config['source'], config['dest']]
 
     process = subprocess.Popen(
@@ -540,9 +676,20 @@ def run_sync(config: dict, display: ProgressDisplay) -> int:
     )
 
     current_file = None
+    last_progress_update = 0
 
     for line in process.stdout:
         line = line.rstrip()
+
+        # Try to parse as progress line first
+        bytes_done, pct, speed = parse_progress_line(line)
+        if bytes_done > 0 or pct > 0:
+            # Update progress display (but not too often)
+            now = time.time()
+            if now - last_progress_update > 0.2:  # Update max 5 times/second
+                display.update_transfer_progress(bytes_done, pct, speed)
+                last_progress_update = now
+            continue
 
         # Parse itemize output
         path, reason, is_delete = parse_itemize(line)
@@ -639,8 +786,8 @@ Notes:
 
     # Scan files
     display.print_scanning()
-    files = scan_files(config)
-    display.set_files(files)
+    files, total_bytes = scan_files(config)
+    display.set_files(files, total_bytes)
 
     if not files:
         return 0
