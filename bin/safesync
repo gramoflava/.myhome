@@ -1,270 +1,675 @@
-#!/usr/bin/env zsh
-# safesync — robust, resumable directory sync over SSH with smart defaults
+#!/usr/bin/env python3
+"""
+safesync — robust, resumable directory sync with visual progress
 
-# Don't use set -e, we need to handle rsync exit codes manually
+REQUIREMENTS:
+    1. Large files (like ML models) should be synced but NOT re-copied every time
+       - Uses size + modification time comparison by default (fast)
+       - Optional checksum verification with -c flag (thorough but slow)
+    2. Interrupted transfers must resume from where they left off, not restart
+       - Uses --partial to keep partial files
+       - Uses --inplace to update files in place (enables true resume)
+    3. Files deleted from source should be deleted from destination
+       - Uses --delete-delay by default (deletes after transfer completes)
+       - Use --no-delete to preserve extra files in destination
+    4. No permission errors on cross-filesystem syncs
+       - Uses -rlDht instead of -a (no permissions, no owner, no group)
+       - Preserves times for proper comparison
 
-# ANSI colors for output
-COLOR_RESET="\x1b[0m"
-COLOR_RED="\x1b[31m"
-COLOR_YELLOW="\x1b[33m"
-COLOR_GREEN="\x1b[32m"
-COLOR_BLUE="\x1b[34m"
+FEATURES:
+    - Visual file list with status markers:
+        ○ pending (queued for transfer)
+        → copying (currently transferring)
+        ✓ done (successfully transferred)
+        × deleted (removed from destination)
+        ! error (transfer failed)
+    - Real-time progress bar with file count
+    - Pre-scan shows all files before transfer begins
+    - Final summary with statistics
 
-color_tag() {
-    local tag="$1"
-    local color="$2"
-    if [[ -t 2 ]]; then
-        echo -n "${color}${tag}${COLOR_RESET}"
-    else
-        echo -n "$tag"
-    fi
-}
+COMPARISON MODES:
+    Default:        size + modification time (recommended for most cases)
+    --checksum:     content checksum (use for critical data verification)
+    --size-only:    file size only (fastest, may miss same-size changes)
+"""
 
-print_error() {
-    echo "$(color_tag "ERROR" "$COLOR_RED"): $*" >&2
-}
+import argparse
+import subprocess
+import sys
+import os
+import re
+import shutil
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
 
-print_warning() {
-    echo "$(color_tag "WARN" "$COLOR_YELLOW"): $*" >&2
-}
+# ============================================================================
+# ANSI TERMINAL CONTROL
+# ============================================================================
 
-print_info() {
-    echo "$(color_tag "INFO" "$COLOR_BLUE"): $*" >&2
-}
+class Term:
+    """ANSI terminal control codes"""
+    RESET = "\x1b[0m"
+    RED = "\x1b[31m"
+    GREEN = "\x1b[32m"
+    YELLOW = "\x1b[33m"
+    BLUE = "\x1b[34m"
+    CYAN = "\x1b[36m"
+    DIM = "\x1b[2m"
+    BOLD = "\x1b[1m"
 
-print_success() {
-    echo "$(color_tag "OK" "$COLOR_GREEN"): $*" >&2
-}
+    # Cursor movement
+    UP = "\x1b[A"
+    DOWN = "\x1b[B"
+    CLEAR_LINE = "\x1b[2K"
+    SAVE_POS = "\x1b[s"
+    RESTORE_POS = "\x1b[u"
+    HIDE_CURSOR = "\x1b[?25l"
+    SHOW_CURSOR = "\x1b[?25h"
 
-usage() {
-    cat << 'EOF'
-safesync - Robust, resumable directory sync over SSH
+    @staticmethod
+    def move_up(n: int) -> str:
+        return f"\x1b[{n}A" if n > 0 else ""
 
-Usage:
-    safesync [OPTIONS] SOURCE DESTINATION
+    @staticmethod
+    def move_down(n: int) -> str:
+        return f"\x1b[{n}B" if n > 0 else ""
 
-Arguments:
-    SOURCE          Source directory (local or remote user@host:/path)
-    DESTINATION     Destination directory (local or remote user@host:/path)
+    @staticmethod
+    def move_to_col(n: int) -> str:
+        return f"\x1b[{n}G"
 
-Options:
-    -p, --port PORT        SSH port (default: 22, or $RSYNC_SSH_PORT)
-    -n, --dry-run          Show what would be transferred without doing it
-    --no-delete            Keep extra files in DEST (default: delete for exact mirror)
-    --no-checksum          Skip checksum verification (faster, less safe)
-    --preserve-times       Preserve modification times (default: disabled)
-    -v, --verbose          Show detailed transfer information
-    -h, --help             Show this help message
+def is_tty() -> bool:
+    """Check if stdout is a terminal"""
+    return sys.stdout.isatty()
 
-Environment Variables:
-    RSYNC_SSH_PORT         Default SSH port (overridden by -p/--port)
+def color(text: str, c: str) -> str:
+    """Apply color if terminal supports it"""
+    if is_tty():
+        return f"{c}{text}{Term.RESET}"
+    return text
 
+# ============================================================================
+# DATA STRUCTURES
+# ============================================================================
+
+class FileStatus(Enum):
+    PENDING = "pending"      # Queued for transfer
+    COPYING = "copying"      # Currently being transferred
+    DONE = "done"            # Successfully transferred
+    SKIPPED = "skipped"      # Unchanged, skipped
+    DELETED = "deleted"      # Will be/was deleted from dest
+    ERROR = "error"          # Transfer failed
+
+@dataclass
+class FileEntry:
+    """Represents a file in the transfer list"""
+    path: str
+    status: FileStatus = FileStatus.PENDING
+    reason: str = ""         # Why it needs transfer (size/time/checksum/new)
+    size: int = 0
+    is_delete: bool = False
+
+    def status_marker(self) -> str:
+        """Return colored status marker"""
+        markers = {
+            FileStatus.PENDING: ("○", Term.DIM),
+            FileStatus.COPYING: ("→", Term.CYAN + Term.BOLD),
+            FileStatus.DONE: ("✓", Term.GREEN),
+            FileStatus.SKIPPED: ("·", Term.DIM),
+            FileStatus.DELETED: ("×", Term.RED),
+            FileStatus.ERROR: ("!", Term.RED + Term.BOLD),
+        }
+        marker, c = markers.get(self.status, ("?", ""))
+        return color(marker, c)
+
+    def display_line(self, max_width: int = 70) -> str:
+        """Format file entry for display"""
+        marker = self.status_marker()
+
+        # Truncate path if too long
+        path = self.path
+        if len(path) > max_width:
+            path = "…" + path[-(max_width-1):]
+
+        # Add reason in parentheses for pending files
+        suffix = ""
+        if self.status == FileStatus.PENDING and self.reason:
+            suffix = color(f" ({self.reason})", Term.DIM)
+        elif self.status == FileStatus.DELETED:
+            suffix = color(" (delete)", Term.DIM)
+
+        return f"  {marker} {path}{suffix}"
+
+@dataclass
+class SyncStats:
+    """Transfer statistics"""
+    total_files: int = 0
+    transferred: int = 0
+    skipped: int = 0
+    deleted: int = 0
+    errors: int = 0
+    bytes_transferred: int = 0
+
+# ============================================================================
+# RSYNC OUTPUT PARSING
+# ============================================================================
+
+def parse_itemize(line: str) -> tuple[str, str, bool]:
+    """
+    Parse rsync --itemize-changes output.
+    Returns: (filename, reason, is_delete)
+
+    Format: YXcstpoguax path
+    Y = update type: < sending, > receiving, c local change, h hard link, . unchanged, * deleting
+    X = file type: f file, d directory, L symlink, D device, S special
+    c = checksum differs
+    s = size differs
+    t = time differs
+    p = permissions differ
+    o = owner differs
+    g = group differs
+    u = reserved
+    a = ACL differs
+    x = extended attrs differ
+
+    For new files: >f+++++++++ filename (all '+' means new)
+    """
+    if not line or len(line) < 12:
+        return ("", "", False)
+
+    # Check for delete marker
+    if line.startswith("*deleting"):
+        path = line[10:].strip()
+        return (path, "delete", True)
+
+    # Parse itemize format
+    flags = line[:11]
+    path = line[12:].strip() if len(line) > 12 else ""
+
+    if not path:
+        return ("", "", False)
+
+    # Skip if not a file transfer indicator
+    if flags[0] not in '<>ch':
+        return ("", "", False)
+
+    # Check if it's a completely new file (all '+' after type indicator)
+    if '+' in flags[2:]:
+        # Count '+' - if most positions are '+', it's a new file
+        plus_count = flags[2:].count('+')
+        if plus_count >= 5:  # Most of the change flags are '+'
+            return (path, "new", False)
+
+    # Determine reason for transfer from change flags
+    reasons = []
+    if len(flags) > 2 and flags[2] == 'c':
+        reasons.append("checksum")
+    if len(flags) > 3 and flags[3] == 's':
+        reasons.append("size")
+    if len(flags) > 4 and flags[4] == 't':
+        reasons.append("time")
+
+    reason = "/".join(reasons) if reasons else "update"
+    is_delete = flags[0] == '*'
+
+    return (path, reason, is_delete)
+
+# ============================================================================
+# PROGRESS DISPLAY
+# ============================================================================
+
+class ProgressDisplay:
+    """Manages the terminal display with line updates"""
+
+    def __init__(self, max_display: int = 15):
+        self.max_display = max_display
+        self.files: list[FileEntry] = []
+        self.stats = SyncStats()
+        self.header_lines = 0
+        self.file_list_start = 0
+        self.initialized = False
+        self.use_fancy = is_tty()
+        self.progress_line_shown = False
+
+    def print_header(self, config: dict):
+        """Print transfer configuration header"""
+        lines = [
+            "",
+            color("Transfer configuration:", Term.BLUE + Term.BOLD),
+            f"  Source:      {config['source']}",
+            f"  Destination: {config['dest']}",
+        ]
+
+        if config.get('is_remote'):
+            lines.append(f"  SSH port:    {config.get('port', 22)}")
+        else:
+            lines.append("  Mode:        Local")
+
+        # Comparison mode
+        if config.get('checksum'):
+            compare_mode = "checksum (thorough)"
+        elif config.get('size_only'):
+            compare_mode = "size only (fastest)"
+        else:
+            compare_mode = "size + time (default)"
+        lines.append(f"  Compare:     {compare_mode}")
+        lines.append(f"  Delete:      {'enabled' if config.get('delete') else 'disabled'}")
+
+        if config.get('dry_run'):
+            lines.append(color("  [DRY RUN - no changes will be made]", Term.YELLOW))
+
+        lines.append("")
+
+        for line in lines:
+            print(line)
+
+        self.header_lines = len(lines)
+
+    def print_scanning(self):
+        """Show scanning message"""
+        print(color("Scanning files...", Term.BLUE))
+        sys.stdout.flush()
+
+    def set_files(self, files: list[FileEntry]):
+        """Set the file list and print initial state"""
+        self.files = files
+        self.stats.total_files = len([f for f in files if not f.is_delete])
+
+        # Clear scanning message and print file list
+        if self.use_fancy:
+            print(Term.CLEAR_LINE + Term.UP + Term.CLEAR_LINE, end="")
+
+        # Count by type
+        to_transfer = [f for f in files if not f.is_delete]
+        to_delete = [f for f in files if f.is_delete]
+
+        if not files:
+            print(color("✓ Already in sync, nothing to transfer", Term.GREEN))
+            return
+
+        summary_parts = []
+        if to_transfer:
+            summary_parts.append(f"{len(to_transfer)} to transfer")
+        if to_delete:
+            summary_parts.append(f"{len(to_delete)} to delete")
+
+        print(color(f"Found {', '.join(summary_parts)}:", Term.BLUE))
+        print()
+
+        self.file_list_start = self.header_lines + 3
+
+        # Print file list (limited to max_display)
+        display_files = files[:self.max_display]
+        for f in display_files:
+            print(f.display_line())
+
+        if len(files) > self.max_display:
+            remaining = len(files) - self.max_display
+            print(color(f"  ... and {remaining} more files", Term.DIM))
+
+        # Progress line (will be updated)
+        print()
+        self._print_progress_line()
+        print()
+        self.initialized = True
+        self.progress_line_shown = True
+        sys.stdout.flush()
+
+    def _print_progress_line(self):
+        """Print/update the progress line"""
+        total = len(self.files)
+        done = self.stats.transferred + self.stats.deleted + self.stats.errors
+        pct = int(done / total * 100) if total > 0 else 0
+
+        # Create progress bar
+        bar_width = 30
+        filled = int(bar_width * done / total) if total > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+
+        line = f"  [{bar}] {done}/{total} ({pct}%)"
+        print(color(line, Term.CYAN), end="")
+        sys.stdout.flush()
+
+    def _update_progress(self):
+        """Update the progress line in place"""
+        if not self.use_fancy or not self.progress_line_shown:
+            return
+
+        # Move to progress line (1 line up from current position)
+        sys.stdout.write(Term.SAVE_POS)
+        sys.stdout.write(Term.move_up(1))
+        sys.stdout.write("\r" + Term.CLEAR_LINE)
+        self._print_progress_line()
+        sys.stdout.write(Term.RESTORE_POS)
+        sys.stdout.flush()
+
+    def update_file(self, path: str, status: FileStatus):
+        """Update a file's status and refresh display"""
+        for i, f in enumerate(self.files):
+            if f.path == path:
+                f.status = status
+
+                # Update stats
+                if status == FileStatus.DONE:
+                    if f.is_delete:
+                        self.stats.deleted += 1
+                    else:
+                        self.stats.transferred += 1
+                elif status == FileStatus.ERROR:
+                    self.stats.errors += 1
+
+                # Update display if file is visible
+                if self.use_fancy and i < self.max_display and self.initialized:
+                    self._update_line(i, f)
+
+                # Update progress bar
+                if status in (FileStatus.DONE, FileStatus.ERROR):
+                    self._update_progress()
+
+                break
+
+    def _update_line(self, idx: int, entry: FileEntry):
+        """Update a specific line in the file list"""
+        # Calculate how many lines to go up from current position
+        # Layout: file list, ["... more"], empty line, progress line, empty line
+        # Current cursor is after the last empty line
+        visible_files = min(len(self.files), self.max_display)
+        has_more_line = len(self.files) > self.max_display
+
+        # Lines from end: empty(1) + progress(1) + empty(1) + [more(1)] + remaining files
+        lines_from_end = 3  # two empty lines + progress line
+        if has_more_line:
+            lines_from_end += 1
+        lines_from_end += (visible_files - 1 - idx)
+
+        # Move up, clear line, print new content, move back down
+        sys.stdout.write(Term.SAVE_POS)
+        sys.stdout.write(Term.move_up(lines_from_end))
+        sys.stdout.write("\r" + Term.CLEAR_LINE)
+        sys.stdout.write(entry.display_line())
+        sys.stdout.write(Term.RESTORE_POS)
+        sys.stdout.flush()
+
+    def mark_copying(self, path: str):
+        """Mark a file as currently being copied"""
+        self.update_file(path, FileStatus.COPYING)
+
+    def mark_done(self, path: str):
+        """Mark a file as successfully transferred"""
+        self.update_file(path, FileStatus.DONE)
+
+    def mark_deleted(self, path: str):
+        """Mark a file as deleted"""
+        for f in self.files:
+            if f.path == path and f.is_delete:
+                self.update_file(path, FileStatus.DONE)  # Use DONE with × marker
+                break
+
+    def print_summary(self, dry_run: bool = False):
+        """Print final summary"""
+        print()
+
+        if dry_run:
+            print(color("Dry run completed", Term.GREEN + Term.BOLD))
+        elif self.stats.errors > 0:
+            print(color("Transfer completed with errors", Term.YELLOW + Term.BOLD))
+        else:
+            print(color("Transfer completed successfully", Term.GREEN + Term.BOLD))
+
+        print()
+        print("Summary:")
+
+        if self.stats.transferred > 0:
+            print(f"  {color('✓', Term.GREEN)} {self.stats.transferred} file(s) transferred")
+
+        if self.stats.deleted > 0:
+            print(f"  {color('×', Term.RED)} {self.stats.deleted} file(s) deleted")
+
+        skipped = self.stats.total_files - self.stats.transferred - self.stats.errors
+        if skipped > 0:
+            print(f"  {color('·', Term.DIM)} {skipped} file(s) unchanged")
+
+        if self.stats.errors > 0:
+            print(f"  {color('!', Term.RED)} {self.stats.errors} error(s)")
+
+        print()
+
+# ============================================================================
+# RSYNC WRAPPER
+# ============================================================================
+
+def check_rsync() -> bool:
+    """Check if rsync is available and version is adequate"""
+    if not shutil.which("rsync"):
+        print(color("ERROR", Term.RED) + ": rsync not found. Install it first:")
+        print("  macOS:  brew install rsync")
+        print("  Linux:  apt install rsync / yum install rsync")
+        return False
+
+    result = subprocess.run(["rsync", "--version"], capture_output=True, text=True)
+    version_match = re.search(r'(\d+)\.(\d+)\.(\d+)', result.stdout)
+
+    if version_match:
+        major, minor = int(version_match.group(1)), int(version_match.group(2))
+        if major < 3 or (major == 3 and minor < 1):
+            print(color("WARN", Term.YELLOW) + f": rsync {version_match.group(0)} detected (3.1.0+ recommended)")
+            print("  macOS built-in rsync is outdated. Install via: brew install rsync")
+
+    return True
+
+def build_rsync_opts(config: dict) -> list[str]:
+    """Build rsync command options"""
+    opts = [
+        "-rlDht",         # recursive, links, devices, human-readable, times (no perms/owner)
+        "--partial",      # Keep partial files for resume
+        "--inplace",      # Update files in place (better for large files, enables resume)
+        "--mkpath",       # Create destination if missing
+        "--itemize-changes",  # Show what changed (for parsing)
+    ]
+
+    # Remote transfer options
+    if config.get('is_remote'):
+        port = config.get('port', 22)
+        opts.extend(["-e", f"ssh -p {port}"])
+        opts.append("--timeout=60")
+
+    # Comparison method
+    # Default: size + modification time (fast, good for most cases)
+    # With --checksum: verify content via checksums (slow but thorough)
+    # With --size-only: ignore time, only compare size (fastest, less accurate)
+    if config.get('checksum'):
+        opts.append("-c")
+    elif config.get('size_only'):
+        opts.append("--size-only")
+    # else: default rsync behavior (size + mtime)
+
+    # Delete handling
+    if config.get('delete'):
+        opts.append("--delete-delay")
+
+    # Dry run
+    if config.get('dry_run'):
+        opts.append("--dry-run")
+
+    return opts
+
+def scan_files(config: dict) -> list[FileEntry]:
+    """
+    Scan source and destination to determine what will be transferred.
+    Uses rsync --dry-run --itemize-changes to get the file list.
+    """
+    opts = build_rsync_opts(config)
+
+    # Force dry-run for scanning
+    if "--dry-run" not in opts:
+        opts.append("--dry-run")
+
+    cmd = ["rsync"] + opts + [config['source'], config['dest']]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    files = []
+    for line in result.stdout.splitlines():
+        path, reason, is_delete = parse_itemize(line)
+        if path and not path.endswith('/'):  # Skip directories
+            entry = FileEntry(
+                path=path,
+                reason=reason,
+                is_delete=is_delete,
+                status=FileStatus.DELETED if is_delete else FileStatus.PENDING
+            )
+            files.append(entry)
+
+    return files
+
+def run_sync(config: dict, display: ProgressDisplay) -> int:
+    """
+    Execute the actual rsync transfer with progress tracking.
+    Returns exit code.
+    """
+    opts = build_rsync_opts(config)
+    cmd = ["rsync"] + opts + [config['source'], config['dest']]
+
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    current_file = None
+
+    for line in process.stdout:
+        line = line.rstrip()
+
+        # Parse itemize output
+        path, reason, is_delete = parse_itemize(line)
+
+        if path:
+            # Mark previous file as done
+            if current_file:
+                display.mark_done(current_file)
+
+            if is_delete:
+                display.mark_deleted(path)
+                current_file = None
+            else:
+                display.mark_copying(path)
+                current_file = path
+
+    # Mark last file as done
+    if current_file:
+        display.mark_done(current_file)
+
+    process.wait()
+    return process.returncode
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Robust, resumable directory sync with visual progress",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
 Examples:
-    # Sync local directory to remote server
     safesync ~/Documents/ user@server:~/backup/
-
-    # Sync from remote to local with custom SSH port
     safesync -p 2222 user@server:/data/ ~/local-data/
+    safesync -n ~/source/ ~/destination/  # dry run
+    safesync --no-delete ~/source/ ~/dest/
+    safesync -c ~/models/ /backup/models/  # checksum verification
 
-    # Local directory sync (creates exact mirror)
-    safesync ~/source/ ~/backup/
-
-    # Dry run to see what would be transferred
-    safesync -n ~/src/ user@server:~/dest/
-
-    # Keep extra files on destination (don't delete)
-    safesync --no-delete ~/source/ ~/destination/
+Comparison modes:
+    Default:      size + modification time (fast, recommended)
+    --checksum:   content checksum (slow but thorough)
+    --size-only:  file size only (fastest, may miss changes)
 
 Notes:
-    • Trailing slash matters: "SRC/" copies contents, "SRC" creates subdirectory
-    • Requires rsync 3.1.0+ (use Homebrew on macOS, not built-in 2.6.9)
-    • Uses checksums (-c) by default for data integrity verification
-    • Partial transfers are automatically resumed if interrupted
-    • Creates destination path if missing (--mkpath)
+    - Trailing slash matters: "src/" copies contents, "src" creates subdirectory
+    - Interrupted transfers are automatically resumed (--partial --inplace)
+    - Files deleted in source are deleted in destination (use --no-delete to keep)
+"""
+    )
 
-EOF
-}
+    parser.add_argument("source", help="Source directory (local or remote)")
+    parser.add_argument("dest", help="Destination directory (local or remote)")
+    parser.add_argument("-p", "--port", type=int, default=int(os.environ.get("RSYNC_SSH_PORT", 22)),
+                        help="SSH port (default: 22 or $RSYNC_SSH_PORT)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Show what would be transferred without doing it")
+    parser.add_argument("--no-delete", action="store_true",
+                        help="Keep extra files in destination")
+    parser.add_argument("-c", "--checksum", action="store_true",
+                        help="Use checksums for comparison (slower but thorough)")
+    parser.add_argument("--size-only", action="store_true",
+                        help="Compare by size only, ignore modification time (fastest)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Show detailed output")
 
-# Parse arguments
-SSH_PORT="${RSYNC_SSH_PORT:-22}"
-DRY_RUN=0
-DELETE=1  # Default: delete for exact mirror
-USE_CHECKSUM=1
-PRESERVE_TIMES=0
-VERBOSE=0
-SOURCE=""
-DESTINATION=""
+    args = parser.parse_args()
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        -p|--port)
-            if [[ -z "$2" || "$2" == -* ]]; then
-                print_error "Option $1 requires an argument"
-                exit 1
-            fi
-            SSH_PORT="$2"
-            shift 2
-            ;;
-        -n|--dry-run)
-            DRY_RUN=1
-            shift
-            ;;
-        --no-delete)
-            DELETE=0
-            shift
-            ;;
-        --no-checksum)
-            USE_CHECKSUM=0
-            shift
-            ;;
-        --preserve-times)
-            PRESERVE_TIMES=1
-            shift
-            ;;
-        -v|--verbose)
-            VERBOSE=1
-            shift
-            ;;
-        -*)
-            print_error "Unknown option: $1"
-            usage
-            exit 1
-            ;;
-        *)
-            if [[ -z "$SOURCE" ]]; then
-                SOURCE="$1"
-            elif [[ -z "$DESTINATION" ]]; then
-                DESTINATION="$1"
-            else
-                print_error "Too many arguments"
-                usage
-                exit 1
-            fi
-            shift
-            ;;
-    esac
-done
+    # Check rsync availability
+    if not check_rsync():
+        return 1
 
-# Validate arguments
-if [[ -z "$SOURCE" || -z "$DESTINATION" ]]; then
-    print_error "Both SOURCE and DESTINATION are required"
-    usage
-    exit 1
-fi
+    # Detect remote transfer
+    is_remote = (':' in args.source and not re.match(r'^[A-Za-z]:[/\\]', args.source)) or \
+                (':' in args.dest and not re.match(r'^[A-Za-z]:[/\\]', args.dest))
 
-# Check if rsync is available and version
-if ! command -v rsync >/dev/null 2>&1; then
-    print_error "rsync not found. Install it first:"
-    echo "  macOS:  brew install rsync" >&2
-    echo "  Linux:  apt install rsync / yum install rsync" >&2
-    exit 1
-fi
+    config = {
+        'source': args.source,
+        'dest': args.dest,
+        'port': args.port,
+        'is_remote': is_remote,
+        'dry_run': args.dry_run,
+        'delete': not args.no_delete,
+        'checksum': args.checksum,
+        'size_only': args.size_only,
+        'verbose': args.verbose,
+    }
 
-RSYNC_VERSION=$(rsync --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-if [[ -n "$RSYNC_VERSION" ]]; then
-    RSYNC_MAJOR=$(echo "$RSYNC_VERSION" | cut -d. -f1)
-    RSYNC_MINOR=$(echo "$RSYNC_VERSION" | cut -d. -f2)
+    # Initialize display
+    display = ProgressDisplay()
 
-    if [[ "$RSYNC_MAJOR" -lt 3 || ("$RSYNC_MAJOR" -eq 3 && "$RSYNC_MINOR" -lt 1) ]]; then
-        print_warning "rsync version $RSYNC_VERSION detected (3.1.0+ recommended)"
-        print_warning "macOS built-in rsync is outdated. Install via: brew install rsync"
-    fi
-fi
+    # Print header
+    display.print_header(config)
 
-# Detect if this is a remote transfer (contains : but not local path like C:)
-IS_REMOTE=0
-if [[ "$SOURCE" == *:* && ! "$SOURCE" =~ ^[A-Za-z]:[/\\] ]] || \
-   [[ "$DESTINATION" == *:* && ! "$DESTINATION" =~ ^[A-Za-z]:[/\\] ]]; then
-    IS_REMOTE=1
-fi
+    # Scan files
+    display.print_scanning()
+    files = scan_files(config)
+    display.set_files(files)
 
-# Build rsync command
-# Minimal flags for reliable sync without permission headaches
-RSYNC_OPTS=(
-    -rlDh                 # recursive, links, devices, human-readable (no perms/owner/group)
-    --info=progress2      # Modern progress indicator
-    --stats               # Show transfer statistics at end
-    --partial             # Keep partially transferred files for resume
-    --inplace             # Update files in place (better for large files)
-    --mkpath              # Create destination path if missing
-)
+    if not files:
+        return 0
 
-if [[ $IS_REMOTE -eq 1 ]]; then
-    RSYNC_OPTS+=(-e "ssh -p ${SSH_PORT}")
-    RSYNC_OPTS+=(--timeout=60)  # Timeout only for remote transfers
-fi
+    # Hide cursor during transfer
+    if is_tty():
+        print(Term.HIDE_CURSOR, end="")
 
-if [[ $USE_CHECKSUM -eq 1 ]]; then
-    RSYNC_OPTS+=(-c)
-fi
+    try:
+        # Run sync
+        exit_code = run_sync(config, display)
 
-if [[ $PRESERVE_TIMES -eq 1 ]]; then
-    RSYNC_OPTS+=(-t)  # Add times preservation only when requested
-fi
+        # Print summary
+        display.print_summary(dry_run=args.dry_run)
 
-if [[ $DRY_RUN -eq 1 ]]; then
-    RSYNC_OPTS+=(--dry-run)
-    print_info "DRY RUN - No files will be transferred"
-fi
+        if exit_code == 0:
+            return 0
+        elif exit_code == 23:
+            # Partial transfer - check if just permission errors
+            print(color("WARN", Term.YELLOW) + ": Some files may have had permission issues")
+            return 0
+        else:
+            print(color("ERROR", Term.RED) + f": rsync exited with code {exit_code}")
+            return exit_code
 
-if [[ $DELETE -eq 1 ]]; then
-    RSYNC_OPTS+=(--delete-delay)
-else
-    print_info "Preserving extra files in DEST (exact mirror disabled)"
-fi
+    finally:
+        # Show cursor again
+        if is_tty():
+            print(Term.SHOW_CURSOR, end="")
 
-if [[ $VERBOSE -eq 1 ]]; then
-    RSYNC_OPTS+=(--itemize-changes)  # Show what changed for each file
-fi
-
-# Show transfer summary
-print_info "Transfer configuration:"
-echo "  Source:      $SOURCE" >&2
-echo "  Destination: $DESTINATION" >&2
-if [[ $IS_REMOTE -eq 1 ]]; then
-    echo "  SSH port:    $SSH_PORT" >&2
-else
-    echo "  Mode:        Local" >&2
-fi
-echo "  Checksum:    $([ $USE_CHECKSUM -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
-echo "  Delete:      $([ $DELETE -eq 1 ] && echo 'enabled' || echo 'disabled')" >&2
-echo >&2
-
-# Execute rsync and capture output to check for permission-only errors
-RSYNC_OUTPUT=$(mktemp)
-cleanup() { rm -f "$RSYNC_OUTPUT"; }
-trap cleanup EXIT
-
-rsync "${RSYNC_OPTS[@]}" "$SOURCE" "$DESTINATION" 2>&1 | tee "$RSYNC_OUTPUT"
-EXIT_CODE=${pipestatus[1]}
-
-# Check the exit code and handle different scenarios
-if [[ $EXIT_CODE -eq 0 ]]; then
-    if [[ $DRY_RUN -eq 1 ]]; then
-        print_success "Dry run completed"
-    else
-        print_success "Transfer completed successfully"
-    fi
-    exit 0
-elif [[ $EXIT_CODE -eq 23 ]]; then
-    # Exit code 23: Partial transfer due to error
-    # Check if it's only permission errors (non-critical)
-    if grep -q "failed to set permissions\|failed to set times\|failed to set owner" "$RSYNC_OUTPUT" && \
-       ! grep -q "failed to open\|No such file\|Permission denied.*read\|failed to read\|failed to write\|failed to send\|failed to receive" "$RSYNC_OUTPUT"; then
-        print_warning "Transfer completed with permission/attribute warnings (non-critical)"
-        print_info "Files were transferred successfully, but some permissions/attributes could not be set"
-        exit 0
-    else
-        # Real errors beyond just permissions
-        print_error "Transfer failed with exit code $EXIT_CODE"
-        exit $EXIT_CODE
-    fi
-else
-    # Other error codes
-    print_error "Transfer failed with exit code $EXIT_CODE"
-    exit $EXIT_CODE
-fi
+if __name__ == "__main__":
+    sys.exit(main())
