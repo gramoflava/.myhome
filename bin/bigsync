@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-safesync — robust, resumable directory sync with visual progress
+bigsync — robust, resumable directory sync with visual progress
 
 REQUIREMENTS:
     1. Large files (like ML models) should be synced but NOT re-copied every time
@@ -723,11 +723,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    safesync ~/Documents/ user@server:~/backup/
-    safesync -p 2222 user@server:/data/ ~/local-data/
-    safesync -n ~/source/ ~/destination/  # dry run
-    safesync --no-delete ~/source/ ~/dest/
-    safesync -c ~/models/ /backup/models/  # checksum verification
+    bigsync ~/Documents/ user@server:~/backup/
+    bigsync -p 2222 user@server:/data/ ~/local-data/
+    bigsync -n ~/source/ ~/destination/  # dry run
+    bigsync --no-delete ~/source/ ~/dest/
+    bigsync -c ~/models/ /backup/models/  # checksum verification
 
 Comparison modes:
     Default:      size + modification time (fast, recommended)

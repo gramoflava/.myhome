@@ -76,7 +76,7 @@ Run without arguments to access the interactive configuration manager:
 - `ffmpeg` - Media processor
 
 ### Custom Tools & Features
-- **safesync** - Standalone CLI tool for robust, resumable directory sync over SSH (see below)
+- **bigsync** - Standalone CLI tool for robust, resumable directory sync over SSH (see below)
 - **automat.py** - Video transcoding automation tool with smart quality presets
 - **png2icns.py** - Convert PNG images to macOS .icns format
 - **Path expansion** - Type `/o/a/c<Tab>` to expand to `/opt/ai-stack/compose`
@@ -95,7 +95,7 @@ This prevents external tools (like `oh-my-zsh`, language installers, etc.) from 
 
 ## Custom Tools
 
-### safesync - Robust SSH Sync
+### bigsync - Robust SSH Sync
 
 Standalone CLI tool for reliable, resumable file transfers over SSH with smart defaults.
 
@@ -111,31 +111,31 @@ Standalone CLI tool for reliable, resumable file transfers over SSH with smart d
 
 ```bash
 # Sync to remote server
-safesync ~/source/ user@server:~/dest/
+bigsync ~/source/ user@server:~/dest/
 
 # Local directory sync (creates exact mirror)
-safesync ~/source/ ~/backup/
+bigsync ~/source/ ~/backup/
 
 # Custom SSH port
-safesync -p 2222 ~/data/ user@server:~/backup/
+bigsync -p 2222 ~/data/ user@server:~/backup/
 
 # Dry run (preview what would be transferred)
-safesync -n ~/files/ user@server:~/files/
+bigsync -n ~/files/ user@server:~/files/
 
 # Keep extra files on destination (disable exact mirror)
-safesync --no-delete ~/source/ ~/destination/
+bigsync --no-delete ~/source/ ~/destination/
 
 # Skip checksum verification (faster, less safe)
-safesync --no-checksum ~/large-files/ user@server:~/backup/
+bigsync --no-checksum ~/large-files/ user@server:~/backup/
 
 # Verbose output
-safesync -v ~/data/ user@server:~/data/
+bigsync -v ~/data/ user@server:~/data/
 
 # Copy to docker directory (automatically matches owner with sudo)
-sudo safesync ~/models/ /var/lib/docker/volumes/data/
+sudo bigsync ~/models/ /var/lib/docker/volumes/data/
 
 # Disable automatic owner matching
-safesync --no-match-owner ~/source/ /destination/
+bigsync --no-match-owner ~/source/ /destination/
 ```
 
 **Important notes:**
@@ -143,7 +143,7 @@ safesync --no-match-owner ~/source/ /destination/
 - Requires rsync 3.1.0+ (macOS: `brew install rsync`)
 - Set `RSYNC_SSH_PORT` environment variable for default port
 
-**Full help:** `safesync --help`
+**Full help:** `bigsync --help`
 
 ---
 
@@ -162,7 +162,7 @@ rm -f ~/.ssh/id_ed25519 ~/.ssh/id_ed25519.pub && ssh-keygen -t ed25519 -N "" -f 
 ```
 .myhome/
 ├── bin/
-│   ├── safesync         # Robust SSH sync tool
+│   ├── bigsync         # Robust SSH sync tool
 │   ├── automat.py     # Video transcoding automation
 │   └── png2icns.py    # PNG to macOS icon converter
 ├── cfg/
