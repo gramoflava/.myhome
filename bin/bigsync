@@ -552,11 +552,11 @@ def build_rsync_opts(config: dict, for_scan: bool = False) -> list[str]:
 
     return opts
 
-def scan_files(config: dict) -> tuple[list[FileEntry], int]:
+def scan_files(config: dict) -> tuple[list[FileEntry], int, str]:
     """
     Scan source and destination to determine what will be transferred.
     Uses rsync --dry-run --itemize-changes to get the file list.
-    Returns: (list of FileEntry, total bytes to transfer)
+    Returns: (list of FileEntry, total bytes to transfer, error message or "")
     """
     opts = build_rsync_opts(config, for_scan=True)
 
@@ -570,6 +570,12 @@ def scan_files(config: dict) -> tuple[list[FileEntry], int]:
     cmd = ["rsync"] + opts + [config['source'], config['dest']]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check for connection/other errors
+    if result.returncode != 0:
+        # Extract meaningful error from stderr
+        error_msg = result.stderr.strip() if result.stderr else f"rsync failed with code {result.returncode}"
+        return [], 0, error_msg
 
     files = []
     total_bytes = 0
@@ -622,7 +628,7 @@ def scan_files(config: dict) -> tuple[list[FileEntry], int]:
                     )
                     files.append(entry)
 
-    return files, total_bytes
+    return files, total_bytes, ""
 
 def parse_size_string(s: str) -> int:
     """Parse size string like '32.77K', '5.24M', '1,234,567' to bytes"""
@@ -786,7 +792,15 @@ Notes:
 
     # Scan files
     display.print_scanning()
-    files, total_bytes = scan_files(config)
+    files, total_bytes, scan_error = scan_files(config)
+
+    if scan_error:
+        # Clear scanning message and show error
+        if is_tty():
+            print(Term.CLEAR_LINE + Term.UP + Term.CLEAR_LINE, end="")
+        print(color("ERROR", Term.RED) + f": {scan_error}")
+        return 1
+
     display.set_files(files, total_bytes)
 
     if not files:
