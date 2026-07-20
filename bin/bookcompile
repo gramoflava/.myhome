@@ -42,9 +42,10 @@ def selected_chapters(inputs: list[Path]) -> tuple[Path, list[Path]]:
     return chapters[0].parent, chapters
 
 
-def combined_markdown(title: str, chapters: list[Path]) -> str:
+def combined_markdown(chapters: list[Path], title: str | None = None) -> str:
     contents = [path.read_text(encoding="utf-8").strip() for path in chapters]
-    return f"# {title}\n\n" + "\n\n---\n\n".join(contents) + "\n"
+    prefix = f"# {title}\n\n" if title else ""
+    return prefix + "\n\n".join(contents) + "\n"
 
 
 def write_atomic(path: Path, content: str) -> None:
@@ -70,7 +71,6 @@ def run_pandoc(
         str(manuscript),
         "--from=gfm",
         "--standalone",
-        "--toc",
         f"--resource-path={source}",
         "--metadata",
         f"title={title}",
@@ -79,6 +79,14 @@ def run_pandoc(
         "--output",
         str(temporary),
     ]
+    if destination.suffix == ".epub":
+        # EPUB readers already expose the navigation document as their table
+        # of contents. Keeping it out of the reading spine avoids an otherwise
+        # mostly-empty TOC spread. Metadata still supplies the book title, so a
+        # second generated title page is unnecessary too.
+        command[2:2] = ["--epub-title-page=false", "--split-level=1"]
+    elif destination.suffix == ".docx":
+        command[2:2] = ["--toc"]
     if author:
         command[command.index("--output"):command.index("--output")] = ["--metadata", f"author={author}"]
     try:
@@ -157,26 +165,31 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = (args.output_dir.expanduser().resolve() if args.output_dir else source / "Exports")
     output_dir.mkdir(parents=True, exist_ok=True)
     manuscript = output_dir / f"{output_name}.md"
-    write_atomic(manuscript, combined_markdown(title, chapters))
 
     created: list[Path] = []
     if "md" in formats:
+        # A visible Markdown master gets a book title for convenience. The
+        # conversion input below does not: EPUB/DOCX receive title metadata,
+        # and another H1 would become a duplicate, empty chapter.
+        visible_title = title if len(chapters) > 1 else None
+        write_atomic(manuscript, combined_markdown(chapters, visible_title))
         created.append(manuscript)
-    for output_format in ("epub", "docx"):
-        if output_format not in formats:
-            continue
-        destination = output_dir / f"{output_name}.{output_format}"
-        try:
-            run_pandoc(pandoc, manuscript, destination, source, title, args.author, args.language)
-        except RuntimeError as error:
-            print(f"bookcompile: {error}", file=sys.stderr)
-            return 1
-        created.append(destination)
-
-    # The Markdown master is a useful conversion input but should honor an
-    # explicit request for only binary formats.
-    if "md" not in formats:
-        manuscript.unlink(missing_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=output_dir, suffix=".md", delete=False) as handle:
+        handle.write(combined_markdown(chapters))
+        conversion_manuscript = Path(handle.name)
+    try:
+        for output_format in ("epub", "docx"):
+            if output_format not in formats:
+                continue
+            destination = output_dir / f"{output_name}.{output_format}"
+            try:
+                run_pandoc(pandoc, conversion_manuscript, destination, source, title, args.author, args.language)
+            except RuntimeError as error:
+                print(f"bookcompile: {error}", file=sys.stderr)
+                return 1
+            created.append(destination)
+    finally:
+        conversion_manuscript.unlink(missing_ok=True)
     for path in created:
         print(path)
     if sys.platform == "darwin" and shutil.which("osascript"):
