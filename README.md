@@ -19,7 +19,7 @@ Install Homebrew, clone repository, and launch auto-configuration all in one cop
     ```bash
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     git clone https://github.com/gramoflava/.myhome.git ~/.myhome
-    chmod +x ~/.myhome/manage.sh && ~/.myhome/manage.sh --init
+    chmod +x ~/.myhome/manage.sh ~/.myhome/init && ~/.myhome/init
     ```
 
 - **Write access**
@@ -27,7 +27,7 @@ Install Homebrew, clone repository, and launch auto-configuration all in one cop
     ```bash
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
     GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:gramoflava/.myhome.git ~/.myhome
-    chmod +x ~/.myhome/manage.sh && ~/.myhome/manage.sh --init
+    chmod +x ~/.myhome/manage.sh ~/.myhome/init && ~/.myhome/init
     ```
 
 ## Configuration Management
@@ -51,7 +51,8 @@ Run without arguments to access the interactive configuration manager:
 ### Command Line
 
 ```bash
-~/.myhome/manage.sh --init    # Initial setup (non-interactive)
+~/.myhome/init                # Initial setup (non-interactive)
+~/.myhome/manage.sh --init    # Same setup through the manager directly
 ~/.myhome/manage.sh --help    # Show usage information
 ```
 

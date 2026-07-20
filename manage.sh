@@ -193,6 +193,7 @@ init() {
             tig       "Text-mode interface for git"
             zsh-completions "Additional completions"
             ffmpeg    "Media processor"
+            pandoc    "Document converter for EPUB and Word exports"
         )
 
         # Init or install Homebrew if missing

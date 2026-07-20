@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Compile selected numbered Markdown chapters into Markdown, EPUB, and DOCX."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+CHAPTER = re.compile(r"^(\d+)\s+-\s+.+\.md$", re.IGNORECASE)
+PANDOC_FORMATS = {"epub", "docx"}
+
+
+def selected_chapters(inputs: list[Path]) -> tuple[Path, list[Path]]:
+    chapters: list[Path] = []
+    for raw_path in inputs:
+        path = raw_path.expanduser().resolve()
+        if path.is_dir():
+            chapters.extend(item for item in path.iterdir() if item.is_file() and CHAPTER.match(item.name))
+        elif path.is_file() and CHAPTER.match(path.name):
+            chapters.append(path)
+        elif path.is_file():
+            raise ValueError(f"not a numbered Markdown chapter: {path}")
+        else:
+            raise ValueError(f"path not found: {path}")
+    chapters = list(dict.fromkeys(chapters))
+    if not chapters:
+        raise ValueError("no 'NN - Title.md' chapter files selected")
+    parents = {path.parent for path in chapters}
+    if len(parents) != 1:
+        raise ValueError("all selected chapters must be from the same folder")
+    chapters.sort(key=lambda path: (int(CHAPTER.match(path.name).group(1)), path.name.casefold()))
+    return chapters[0].parent, chapters
+
+
+def combined_markdown(title: str, chapters: list[Path]) -> str:
+    contents = [path.read_text(encoding="utf-8").strip() for path in chapters]
+    return f"# {title}\n\n" + "\n\n---\n\n".join(contents) + "\n"
+
+
+def write_atomic(path: Path, content: str) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(content)
+        temporary = Path(handle.name)
+    temporary.replace(path)
+
+
+def run_pandoc(
+    pandoc: str,
+    manuscript: Path,
+    destination: Path,
+    source: Path,
+    title: str,
+    author: str | None,
+    language: str,
+) -> None:
+    with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=destination.suffix, delete=False) as handle:
+        temporary = Path(handle.name)
+    command = [
+        pandoc,
+        str(manuscript),
+        "--from=gfm",
+        "--standalone",
+        "--toc",
+        f"--resource-path={source}",
+        "--metadata",
+        f"title={title}",
+        "--metadata",
+        f"lang={language}",
+        "--output",
+        str(temporary),
+    ]
+    if author:
+        command[command.index("--output"):command.index("--output")] = ["--metadata", f"author={author}"]
+    try:
+        result = subprocess.run(command, cwd=source, text=True, capture_output=True)
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+            raise RuntimeError(f"Pandoc could not create {destination.suffix}: {detail}")
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compile 'NN - Title.md' chapters into a complete book",
+        epilog=(
+            "Select chapter files in Finder and pass them as arguments, or pass one folder to include "
+            "all of its numbered chapters. By default, outputs go into the chapters' Exports folder."
+        ),
+    )
+    parser.add_argument(
+        "chapters",
+        type=Path,
+        nargs="+",
+        help="selected 'NN - Title.md' files, or one folder containing them",
+    )
+    parser.add_argument("--title", help="book title (default: source folder name)")
+    parser.add_argument("--author", help="author stored in EPUB/DOCX metadata")
+    parser.add_argument("--language", default="en", help="BCP 47 language tag (default: en)")
+    parser.add_argument("--output-dir", type=Path, help="destination folder (default: CHAPTER_FOLDER/Exports)")
+    parser.add_argument(
+        "--format",
+        dest="formats",
+        action="append",
+        choices=("md", "epub", "docx"),
+        help="output format; repeat for several (default: all three)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        source, chapters = selected_chapters(args.chapters)
+    except (OSError, ValueError) as error:
+        print(f"bookcompile: {error}", file=sys.stderr)
+        return 2
+
+    formats = list(dict.fromkeys(args.formats or ["md", "epub", "docx"]))
+    pandoc = shutil.which("pandoc")
+    if PANDOC_FORMATS.intersection(formats) and not pandoc:
+        print(
+            "bookcompile: Pandoc is required for EPUB/DOCX; run ~/.myhome/init "
+            "or request only --format md",
+            file=sys.stderr,
+        )
+        return 2
+
+    title = args.title or source.name
+    output_dir = (args.output_dir.expanduser().resolve() if args.output_dir else source / "Exports")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manuscript = output_dir / f"{source.name}.md"
+    write_atomic(manuscript, combined_markdown(title, chapters))
+
+    created: list[Path] = []
+    if "md" in formats:
+        created.append(manuscript)
+    for output_format in ("epub", "docx"):
+        if output_format not in formats:
+            continue
+        destination = output_dir / f"{source.name}.{output_format}"
+        try:
+            run_pandoc(pandoc, manuscript, destination, source, title, args.author, args.language)
+        except RuntimeError as error:
+            print(f"bookcompile: {error}", file=sys.stderr)
+            return 1
+        created.append(destination)
+
+    # The Markdown master is a useful conversion input but should honor an
+    # explicit request for only binary formats.
+    if "md" not in formats:
+        manuscript.unlink(missing_ok=True)
+    for path in created:
+        print(path)
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'on run argv\ndisplay notification (item 2 of argv) with title (item 1 of argv)\nend run',
+                "Book compiled",
+                f"{len(chapters)} chapters → {', '.join(formats).upper()}",
+            ],
+            capture_output=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
