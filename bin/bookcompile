@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile selected numbered Markdown chapters into Markdown, EPUB, and DOCX."""
+"""Compile selected Markdown files into Markdown, EPUB, and DOCX."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 
-CHAPTER = re.compile(r"^(\d+)\s+-\s+.+\.md$", re.IGNORECASE)
+CHAPTER_NUMBER = re.compile(r"^(\d+)\s+-\s+.+\.md$", re.IGNORECASE)
 PANDOC_FORMATS = {"epub", "docx"}
 
 
@@ -21,20 +21,24 @@ def selected_chapters(inputs: list[Path]) -> tuple[Path, list[Path]]:
     for raw_path in inputs:
         path = raw_path.expanduser().resolve()
         if path.is_dir():
-            chapters.extend(item for item in path.iterdir() if item.is_file() and CHAPTER.match(item.name))
-        elif path.is_file() and CHAPTER.match(path.name):
+            chapters.extend(item for item in path.iterdir() if item.is_file() and item.suffix.casefold() == ".md")
+        elif path.is_file() and path.suffix.casefold() == ".md":
             chapters.append(path)
         elif path.is_file():
-            raise ValueError(f"not a numbered Markdown chapter: {path}")
+            raise ValueError(f"not a Markdown file: {path}")
         else:
             raise ValueError(f"path not found: {path}")
     chapters = list(dict.fromkeys(chapters))
     if not chapters:
-        raise ValueError("no 'NN - Title.md' chapter files selected")
+        raise ValueError("no Markdown files selected")
     parents = {path.parent for path in chapters}
     if len(parents) != 1:
         raise ValueError("all selected chapters must be from the same folder")
-    chapters.sort(key=lambda path: (int(CHAPTER.match(path.name).group(1)), path.name.casefold()))
+    def sort_key(path: Path) -> tuple[int, int, str]:
+        numbered = CHAPTER_NUMBER.match(path.name)
+        return (0, int(numbered.group(1)), path.name.casefold()) if numbered else (1, 0, path.name.casefold())
+
+    chapters.sort(key=sort_key)
     return chapters[0].parent, chapters
 
 
@@ -89,7 +93,7 @@ def run_pandoc(
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compile 'NN - Title.md' chapters into a complete book",
+        description="Compile selected Markdown files into a complete book",
         epilog=(
             "Examples:\n"
             "  bookcompile '01 - Start.md' '02 - End.md'\n"
@@ -102,10 +106,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "  4. Set Shell to /bin/zsh and 'Pass input' to 'as arguments'.\n"
             "  5. Use this script:\n\n"
             "     source \"$HOME/.zprofile\"\n"
-            "     bookcompile \"$@\"\n\n"
+            "     bookcompile --format epub \"$@\"\n\n"
             "     To embed author metadata, use:\n"
-            "     bookcompile --author \"Author Name\" \"$@\"\n\n"
-            "Selected chapters are sorted numerically. Outputs go into the chapters' Exports folder."
+            "     bookcompile --format epub --author \"Author Name\" \"$@\"\n\n"
+            "Numbered chapters are sorted numerically; other files are sorted by name. "
+            "Outputs go into the selected files' Exports folder."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -113,7 +118,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "chapters",
         type=Path,
         nargs="+",
-        help="selected 'NN - Title.md' files, or one folder containing them",
+        help="selected Markdown files, or one folder containing them",
     )
     parser.add_argument("--title", help="book title (default: source folder name)")
     parser.add_argument("--author", help="author stored in EPUB/DOCX metadata")
@@ -141,16 +146,17 @@ def main(argv: list[str] | None = None) -> int:
     pandoc = shutil.which("pandoc")
     if PANDOC_FORMATS.intersection(formats) and not pandoc:
         print(
-            "bookcompile: Pandoc is required for EPUB/DOCX; run ~/.myhome/init "
+            "bookcompile: Pandoc is required for EPUB/DOCX; run ~/.myhome/manage.sh --init "
             "or request only --format md",
             file=sys.stderr,
         )
         return 2
 
-    title = args.title or source.name
+    output_name = chapters[0].stem if len(chapters) == 1 else source.name
+    title = args.title or output_name
     output_dir = (args.output_dir.expanduser().resolve() if args.output_dir else source / "Exports")
     output_dir.mkdir(parents=True, exist_ok=True)
-    manuscript = output_dir / f"{source.name}.md"
+    manuscript = output_dir / f"{output_name}.md"
     write_atomic(manuscript, combined_markdown(title, chapters))
 
     created: list[Path] = []
@@ -159,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     for output_format in ("epub", "docx"):
         if output_format not in formats:
             continue
-        destination = output_dir / f"{source.name}.{output_format}"
+        destination = output_dir / f"{output_name}.{output_format}"
         try:
             run_pandoc(pandoc, manuscript, destination, source, title, args.author, args.language)
         except RuntimeError as error:

@@ -12,7 +12,7 @@ This directory contains helper utilities for common repetitive tasks. These scri
 - **automat.py** - Media processing tool for optimizing videos and images with ffmpeg/sips
 - **png2icns.py** - Converts PNG images to macOS .icns icon format
 - **bigsync** - Robust, resumable directory sync over SSH with smart defaults
-- **bookcompile** - Compiles numbered Markdown chapters into a full Markdown manuscript, EPUB, and Word DOCX
+- **bookcompile** - Compiles selected Markdown files into a full Markdown manuscript, EPUB, and Word DOCX
 
 ## Requirements
 
@@ -24,17 +24,17 @@ Individual utilities may have specific requirements documented in their help out
 
 ### bookcompile
 
-Select the chapter files in Finder and pass them as arguments (their incoming
-order does not matter; the utility sorts them by chapter number):
+Select one or more Markdown files in Finder and pass them as arguments. Numbered
+chapters are sorted numerically; other filenames are sorted alphabetically:
 
 ```sh
 bookcompile --author "Author Name" "/path/to/Book/01 - Start.md" "/path/to/Book/02 - End.md"
 ```
 
-Passing the book folder instead selects all of its numbered chapters. Either
+Passing a folder instead selects all Markdown files directly inside it. Either
 way, it writes `Book Name.md`, `Book Name.epub`, and `Book Name.docx` under the
-chapters' `Exports/` folder. Files such as `Notebook.md` and anything in
-subfolders are ignored. Use `--format md`, `--format epub`, or `--format docx`
+selected files' `Exports/` folder. Subfolders are ignored. When only one file is
+selected, its filename becomes the output name. Use `--format md`, `--format epub`, or `--format docx`
 to request only selected formats; repeat the option to request more than one.
 
 For a Finder Quick Action in Automator:
@@ -45,7 +45,7 @@ For a Finder Quick Action in Automator:
 
 ```sh
 source "$HOME/.zprofile"
-bookcompile "$@"
+bookcompile --format epub "$@"
 ```
 
 Add `--author "Author Name"` before `"$@"` in that last line when you want the
@@ -54,5 +54,5 @@ name embedded in EPUB and Word metadata.
 The command is non-interactive and shows a macOS notification when conversion
 finishes. All selected chapters must belong to the same folder.
 
-EPUB and DOCX conversion uses Pandoc, installed by `~/.myhome/init`.
+EPUB and DOCX conversion uses Pandoc, installed by `~/.myhome/manage.sh --init`.
 The combined Markdown export needs only Python 3.
