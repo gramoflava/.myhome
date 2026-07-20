@@ -91,9 +91,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compile 'NN - Title.md' chapters into a complete book",
         epilog=(
-            "Select chapter files in Finder and pass them as arguments, or pass one folder to include "
-            "all of its numbered chapters. By default, outputs go into the chapters' Exports folder."
+            "Examples:\n"
+            "  bookcompile '01 - Start.md' '02 - End.md'\n"
+            "  bookcompile --author 'Author Name' /path/to/Book/\n"
+            "  bookcompile --format epub --format docx /path/to/Book/\n\n"
+            "Automator Quick Action (macOS):\n"
+            "  1. Open Automator and create a new Quick Action.\n"
+            "  2. Set 'Workflow receives current' to 'files or folders' in Finder.\n"
+            "  3. Add a 'Run Shell Script' action.\n"
+            "  4. Set Shell to /bin/zsh and 'Pass input' to 'as arguments'.\n"
+            "  5. Use this script:\n\n"
+            "     source \"$HOME/.zprofile\"\n"
+            "     bookcompile \"$@\"\n\n"
+            "     To embed author metadata, use:\n"
+            "     bookcompile --author \"Author Name\" \"$@\"\n\n"
+            "Selected chapters are sorted numerically. Outputs go into the chapters' Exports folder."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "chapters",
