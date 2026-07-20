@@ -66,30 +66,57 @@ def run_pandoc(
 ) -> None:
     with tempfile.NamedTemporaryFile(dir=destination.parent, suffix=destination.suffix, delete=False) as handle:
         temporary = Path(handle.name)
-    command = [
-        pandoc,
-        str(manuscript),
-        "--from=gfm",
-        "--standalone",
-        f"--resource-path={source}",
-        "--metadata",
-        f"title={title}",
-        "--metadata",
-        f"lang={language}",
-        "--output",
-        str(temporary),
-    ]
-    if destination.suffix == ".epub":
-        # EPUB readers already expose the navigation document as their table
-        # of contents. Keeping it out of the reading spine avoids an otherwise
-        # mostly-empty TOC spread. Metadata still supplies the book title, so a
-        # second generated title page is unnecessary too.
-        command[2:2] = ["--epub-title-page=false", "--split-level=1"]
-    elif destination.suffix == ".docx":
-        command[2:2] = ["--toc"]
-    if author:
-        command[command.index("--output"):command.index("--output")] = ["--metadata", f"author={author}"]
+    stylesheet: Path | None = None
     try:
+        command = [
+            pandoc,
+            str(manuscript),
+            "--from=gfm",
+            "--standalone",
+            f"--resource-path={source}",
+            "--metadata",
+            f"title={title}",
+            "--metadata",
+            f"lang={language}",
+            "--output",
+            str(temporary),
+        ]
+        if destination.suffix == ".epub":
+            # EPUB readers already expose the navigation document as their
+            # table of contents. Keep it and the generated title page out of
+            # the reading spine. Pandoc's otherwise useful default EPUB CSS
+            # also forces a page break before every H1; at the beginning of a
+            # new spine item that creates a genuinely blank first page, so
+            # preserve the defaults and append one narrow override.
+            css_result = subprocess.run(
+                [pandoc, "--print-default-data-file=epub.css"],
+                text=True,
+                capture_output=True,
+            )
+            if css_result.returncode:
+                detail = css_result.stderr.strip() or "could not read Pandoc's default EPUB stylesheet"
+                raise RuntimeError(detail)
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=destination.parent, suffix=".css", delete=False
+            ) as css_handle:
+                css_handle.write(css_result.stdout)
+                css_handle.write(
+                    "\n/* A spine item already starts on a new page. */\n"
+                    "section.level1 > h1:first-child {\n"
+                    "  page-break-before: auto;\n"
+                    "  break-before: auto;\n"
+                    "}\n"
+                )
+                stylesheet = Path(css_handle.name)
+            command[2:2] = [
+                "--epub-title-page=false",
+                "--split-level=1",
+                f"--css={stylesheet}",
+            ]
+        elif destination.suffix == ".docx":
+            command[2:2] = ["--toc"]
+        if author:
+            command[command.index("--output"):command.index("--output")] = ["--metadata", f"author={author}"]
         result = subprocess.run(command, cwd=source, text=True, capture_output=True)
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
@@ -97,6 +124,8 @@ def run_pandoc(
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
+        if stylesheet:
+            stylesheet.unlink(missing_ok=True)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
