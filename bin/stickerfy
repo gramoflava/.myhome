@@ -1,0 +1,625 @@
+#!/bin/zsh
+# Keep this utility as one installable file while giving Swift the .swift
+# filename its driver requires. The temporary source is removed on exit.
+set -u
+temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/stickerfy.XXXXXX")"
+trap 'rm -rf "$temporary_directory"' EXIT
+sed -n '/^\/\* STICKERFY_SWIFT \*\/$/,$p' "$0" > "$temporary_directory/stickerfy.swift"
+module_cache="${TMPDIR:-/tmp}/stickerfy-swift-module-cache-$UID"
+mkdir -p "$module_cache"
+CLANG_MODULE_CACHE_PATH="$module_cache" \
+SWIFT_MODULE_CACHE_PATH="$module_cache" \
+    /usr/bin/swift "$temporary_directory/stickerfy.swift" "$@"
+exit $?
+
+/* STICKERFY_SWIFT */
+
+import CoreGraphics
+import CoreImage
+import Foundation
+import ImageIO
+import UniformTypeIdentifiers
+import Vision
+
+let canvasSize = 512
+let telegramLimit = 512 * 1024
+
+struct Options {
+    var inputs: [String] = []
+    var outputDirectory: String?
+    var margin = 26
+    var border = 7
+    var shadowBlur = 6
+    var shadowOffset = 4
+    var shadowOpacity: Float = 0.28
+    var keepBackground = false
+    var notify = true
+}
+
+enum StickerfyError: LocalizedError {
+    case usage(String)
+    case processing(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .usage(let message), .processing(let message): return message
+        }
+    }
+}
+
+func usage() -> String {
+    """
+    Usage: stickerfy [options] IMAGE [IMAGE ...]
+
+    Turn images into Telegram-compatible 512 x 512 PNG stickers. Images with
+    transparency keep their alpha; opaque images use Apple's on-device subject
+    extraction. Results are written to a Stickers folder beside the inputs.
+
+    Options:
+      -o, --output-dir DIR    Write every result to DIR
+          --margin PX        Clear outer margin (default: 26)
+          --border PX        White border width (default: 7)
+          --shadow-blur PX   Shadow softness (default: 6)
+          --shadow-offset PX Downward shadow offset (default: 4)
+          --shadow-opacity N Shadow opacity, 0...1 (default: 0.28)
+          --keep-background  Keep opaque images rectangular
+          --no-notify        Do not show the macOS completion notification
+      -h, --help             Show this help
+
+    Finder Quick Action (Automator):
+      1. Receive current "image files" in Finder.
+      2. Add "Run Shell Script", use /bin/zsh, pass input as arguments.
+      3. Enter:
+
+         source "$HOME/.zprofile"
+         stickerfy "$@"
+    """
+}
+
+func parseArguments() throws -> Options {
+    var options = Options()
+    let arguments = Array(CommandLine.arguments.dropFirst())
+    var index = 0
+
+    func value(after option: String) throws -> String {
+        guard index + 1 < arguments.count else {
+            throw StickerfyError.usage("missing value after \(option)")
+        }
+        index += 1
+        return arguments[index]
+    }
+
+    while index < arguments.count {
+        let argument = arguments[index]
+        switch argument {
+        case "-h", "--help":
+            print(usage())
+            exit(0)
+        case "-o", "--output-dir":
+            options.outputDirectory = try value(after: argument)
+        case "--margin":
+            guard let number = Int(try value(after: argument)), (0...128).contains(number) else {
+                throw StickerfyError.usage("--margin must be between 0 and 128")
+            }
+            options.margin = number
+        case "--border":
+            guard let number = Int(try value(after: argument)), (0...64).contains(number) else {
+                throw StickerfyError.usage("--border must be between 0 and 64")
+            }
+            options.border = number
+        case "--shadow-blur":
+            guard let number = Int(try value(after: argument)), (0...64).contains(number) else {
+                throw StickerfyError.usage("--shadow-blur must be between 0 and 64")
+            }
+            options.shadowBlur = number
+        case "--shadow-offset":
+            guard let number = Int(try value(after: argument)), (-64...64).contains(number) else {
+                throw StickerfyError.usage("--shadow-offset must be between -64 and 64")
+            }
+            options.shadowOffset = number
+        case "--shadow-opacity":
+            guard let number = Float(try value(after: argument)), (0...1).contains(number) else {
+                throw StickerfyError.usage("--shadow-opacity must be between 0 and 1")
+            }
+            options.shadowOpacity = number
+        case "--keep-background": options.keepBackground = true
+        case "--no-notify": options.notify = false
+        case "--":
+            options.inputs.append(contentsOf: arguments.dropFirst(index + 1))
+            index = arguments.count
+            continue
+        default:
+            if argument.hasPrefix("-") {
+                throw StickerfyError.usage("unknown option: \(argument)")
+            }
+            options.inputs.append(argument)
+        }
+        index += 1
+    }
+
+    guard !options.inputs.isEmpty else {
+        throw StickerfyError.usage("no images selected\n\n\(usage())")
+    }
+    guard options.margin + options.border + options.shadowBlur + abs(options.shadowOffset) < 220 else {
+        throw StickerfyError.usage("margin, border, and shadow leave no room for the image")
+    }
+    return options
+}
+
+func expandedInputURLs(_ inputs: [String]) throws -> [URL] {
+    let manager = FileManager.default
+    var urls: [URL] = []
+    for input in inputs {
+        let url = URL(fileURLWithPath: NSString(string: input).expandingTildeInPath).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard manager.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            throw StickerfyError.processing("path not found: \(url.path)")
+        }
+        if isDirectory.boolValue {
+            let children = try manager.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.contentTypeKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+            urls.append(contentsOf: children.filter { candidate in
+                guard let values = try? candidate.resourceValues(forKeys: [.contentTypeKey, .isRegularFileKey]),
+                      values.isRegularFile == true,
+                      let type = values.contentType else { return false }
+                return type.conforms(to: .image)
+            }.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
+        } else {
+            urls.append(url)
+        }
+    }
+    var seen = Set<String>()
+    let unique = urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
+    guard !unique.isEmpty else { throw StickerfyError.processing("no image files selected") }
+    return unique
+}
+
+func loadImage(_ url: URL) throws -> CGImage {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let raw = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        throw StickerfyError.processing("cannot read image: \(url.lastPathComponent)")
+    }
+    let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+    let orientation = (properties?[kCGImagePropertyOrientation] as? NSNumber)?.int32Value ?? 1
+    if orientation == 1 { return raw }
+    let image = CIImage(cgImage: raw).oriented(forExifOrientation: orientation)
+    let context = CIContext(options: [.useSoftwareRenderer: false])
+    guard let normalized = context.createCGImage(image, from: image.extent) else {
+        throw StickerfyError.processing("cannot normalize image: \(url.lastPathComponent)")
+    }
+    return normalized
+}
+
+func rgbaBytes(of image: CGImage) throws -> [UInt8] {
+    let width = image.width
+    let height = image.height
+    var bytes = [UInt8](repeating: 0, count: width * height * 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let ok = bytes.withUnsafeMutableBytes { rawBuffer -> Bool in
+        guard let base = rawBuffer.baseAddress,
+              let context = CGContext(
+                data: base,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+              ) else { return false }
+        context.interpolationQuality = .high
+        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+        return true
+    }
+    guard ok else { throw StickerfyError.processing("could not create image buffer") }
+    return bytes
+}
+
+func hasUsefulTransparency(_ rgba: [UInt8]) -> Bool {
+    var transparent = 0
+    var translucent = 0
+    let pixels = rgba.count / 4
+    for offset in stride(from: 3, to: rgba.count, by: 4) {
+        let alpha = rgba[offset]
+        if alpha < 8 { transparent += 1 }
+        if alpha < 250 { translucent += 1 }
+    }
+    return transparent > pixels / 1000 || translucent > pixels / 100
+}
+
+func originalAlpha(from rgba: [UInt8]) -> [UInt8] {
+    var alpha = [UInt8](repeating: 0, count: rgba.count / 4)
+    for pixel in 0..<alpha.count { alpha[pixel] = rgba[pixel * 4 + 3] }
+    return alpha
+}
+
+func visionMask(for image: CGImage) throws -> [UInt8] {
+    guard #available(macOS 14.0, *) else {
+        throw StickerfyError.processing("background removal requires macOS 14 or newer")
+    }
+    let request = VNGenerateForegroundInstanceMaskRequest()
+    let handler = VNImageRequestHandler(cgImage: image, orientation: .up)
+    try handler.perform([request])
+    guard let observation = request.results?.first else {
+        throw StickerfyError.processing("Apple Vision could not find a foreground subject; try --keep-background")
+    }
+    let pixelBuffer = try observation.generateScaledMaskForImage(
+        forInstances: observation.allInstances,
+        from: handler
+    )
+    CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else {
+        throw StickerfyError.processing("Apple Vision returned an unreadable mask")
+    }
+    let width = CVPixelBufferGetWidth(pixelBuffer)
+    let height = CVPixelBufferGetHeight(pixelBuffer)
+    let rowBytes = CVPixelBufferGetBytesPerRow(pixelBuffer)
+    let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+    var mask = [UInt8](repeating: 0, count: width * height)
+    if pixelFormat == kCVPixelFormatType_OneComponent8 {
+        for row in 0..<height {
+            _ = mask.withUnsafeMutableBytes { destination in
+                memcpy(destination.baseAddress!.advanced(by: row * width), base.advanced(by: row * rowBytes), width)
+            }
+        }
+    } else if pixelFormat == kCVPixelFormatType_OneComponent32Float {
+        for row in 0..<height {
+            let values = base.advanced(by: row * rowBytes).assumingMemoryBound(to: Float.self)
+            for column in 0..<width {
+                let value = max(0, min(1, values[column]))
+                mask[row * width + column] = UInt8((value * 255).rounded())
+            }
+        }
+    } else {
+        throw StickerfyError.processing("Apple Vision returned an unsupported mask format (\(pixelFormat))")
+    }
+    return mask
+}
+
+struct Bounds {
+    let x: Int
+    let y: Int
+    let width: Int
+    let height: Int
+}
+
+func contentBounds(mask: [UInt8], width: Int, height: Int) throws -> Bounds {
+    var minX = width, minY = height, maxX = -1, maxY = -1
+    for y in 0..<height {
+        for x in 0..<width where mask[y * width + x] >= 8 {
+            minX = min(minX, x); maxX = max(maxX, x)
+            minY = min(minY, y); maxY = max(maxY, y)
+        }
+    }
+    guard maxX >= minX, maxY >= minY else {
+        throw StickerfyError.processing("the image is completely transparent")
+    }
+    return Bounds(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+}
+
+func grayscaleImage(bytes: [UInt8], width: Int, height: Int) throws -> CGImage {
+    let data = Data(bytes) as CFData
+    guard let provider = CGDataProvider(data: data),
+          let image = CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent
+          ) else { throw StickerfyError.processing("could not create subject mask") }
+    return image
+}
+
+func scaleToCanvas(
+    image: CGImage,
+    mask: [UInt8],
+    bounds: Bounds,
+    options: Options
+) throws -> (rgba: [UInt8], originalAlpha: [UInt8], mask: [UInt8]) {
+    let reserved = options.margin + options.border + options.shadowBlur + max(0, options.shadowOffset)
+    let available = canvasSize - reserved * 2
+    let scale = min(Double(available) / Double(bounds.width), Double(available) / Double(bounds.height))
+    let targetWidth = max(1, Int((Double(bounds.width) * scale).rounded()))
+    let targetHeight = max(1, Int((Double(bounds.height) * scale).rounded()))
+    let destinationX = (canvasSize - targetWidth) / 2
+    let destinationY = (canvasSize - targetHeight) / 2 + options.shadowOffset / 2
+
+    guard let croppedImage = image.cropping(to: CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)),
+          let fullMaskImage = try? grayscaleImage(bytes: mask, width: image.width, height: image.height),
+          let croppedMask = fullMaskImage.cropping(to: CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)) else {
+        throw StickerfyError.processing("could not crop the subject")
+    }
+
+    var scaledRGBA = [UInt8](repeating: 0, count: canvasSize * canvasSize * 4)
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let drewColor = scaledRGBA.withUnsafeMutableBytes { raw -> Bool in
+        guard let context = CGContext(
+            data: raw.baseAddress, width: canvasSize, height: canvasSize,
+            bitsPerComponent: 8, bytesPerRow: canvasSize * 4, space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        ) else { return false }
+        context.interpolationQuality = .high
+        context.draw(croppedImage, in: CGRect(x: destinationX, y: destinationY, width: targetWidth, height: targetHeight))
+        return true
+    }
+    guard drewColor else { throw StickerfyError.processing("could not resize the image") }
+
+    var scaledMask = [UInt8](repeating: 0, count: canvasSize * canvasSize)
+    let drewMask = scaledMask.withUnsafeMutableBytes { raw -> Bool in
+        guard let context = CGContext(
+            data: raw.baseAddress, width: canvasSize, height: canvasSize,
+            bitsPerComponent: 8, bytesPerRow: canvasSize, space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return false }
+        context.interpolationQuality = .high
+        context.draw(croppedMask, in: CGRect(x: destinationX, y: destinationY, width: targetWidth, height: targetHeight))
+        return true
+    }
+    guard drewMask else { throw StickerfyError.processing("could not resize the subject mask") }
+
+    let scaledOriginalAlpha = originalAlpha(from: scaledRGBA)
+    return (scaledRGBA, scaledOriginalAlpha, scaledMask)
+}
+
+func maximumFilter(_ input: [UInt8], radius: Int) -> [UInt8] {
+    guard radius > 0 else { return input }
+    let size = canvasSize
+    var horizontal = [UInt8](repeating: 0, count: input.count)
+    var output = [UInt8](repeating: 0, count: input.count)
+    for y in 0..<size {
+        for x in 0..<size {
+            var value: UInt8 = 0
+            for xx in max(0, x - radius)...min(size - 1, x + radius) {
+                value = max(value, input[y * size + xx])
+            }
+            horizontal[y * size + x] = value
+        }
+    }
+    for y in 0..<size {
+        for x in 0..<size {
+            var value: UInt8 = 0
+            for yy in max(0, y - radius)...min(size - 1, y + radius) {
+                value = max(value, horizontal[yy * size + x])
+            }
+            output[y * size + x] = value
+        }
+    }
+    return output
+}
+
+func boxBlur(_ input: [Float], radius: Int) -> [Float] {
+    guard radius > 0 else { return input }
+    let size = canvasSize
+    var horizontal = [Float](repeating: 0, count: input.count)
+    var output = [Float](repeating: 0, count: input.count)
+    for y in 0..<size {
+        var sum: Float = 0
+        for x in -radius...radius where x >= 0 && x < size { sum += input[y * size + x] }
+        for x in 0..<size {
+            horizontal[y * size + x] = sum / Float(min(size - 1, x + radius) - max(0, x - radius) + 1)
+            let leaving = x - radius
+            let entering = x + radius + 1
+            if leaving >= 0 { sum -= input[y * size + leaving] }
+            if entering < size { sum += input[y * size + entering] }
+        }
+    }
+    for x in 0..<size {
+        var sum: Float = 0
+        for y in -radius...radius where y >= 0 && y < size { sum += horizontal[y * size + x] }
+        for y in 0..<size {
+            output[y * size + x] = sum / Float(min(size - 1, y + radius) - max(0, y - radius) + 1)
+            let leaving = y - radius
+            let entering = y + radius + 1
+            if leaving >= 0 { sum -= horizontal[leaving * size + x] }
+            if entering < size { sum += horizontal[entering * size + x] }
+        }
+    }
+    return output
+}
+
+func renderSticker(
+    scaled: (rgba: [UInt8], originalAlpha: [UInt8], mask: [UInt8]),
+    options: Options
+) throws -> CGImage {
+    let outline = maximumFilter(scaled.mask, radius: options.border)
+    var shadow = outline.map { Float($0) / 255 }
+    if options.shadowBlur > 0 {
+        let boxRadius = max(1, Int(round(Double(options.shadowBlur) * 0.58)))
+        for _ in 0..<3 { shadow = boxBlur(shadow, radius: boxRadius) }
+    }
+    var output = [UInt8](repeating: 0, count: canvasSize * canvasSize * 4)
+
+    func over(_ sourceR: Float, _ sourceG: Float, _ sourceB: Float, _ sourceA: Float,
+              _ destination: inout (r: Float, g: Float, b: Float, a: Float)) {
+        let inverse = 1 - sourceA
+        destination.r = sourceR * sourceA + destination.r * inverse
+        destination.g = sourceG * sourceA + destination.g * inverse
+        destination.b = sourceB * sourceA + destination.b * inverse
+        destination.a = sourceA + destination.a * inverse
+    }
+
+    for y in 0..<canvasSize {
+        for x in 0..<canvasSize {
+            let pixel = y * canvasSize + x
+            var color: (r: Float, g: Float, b: Float, a: Float) = (0, 0, 0, 0)
+            let shadowY = y - options.shadowOffset
+            if shadowY >= 0 && shadowY < canvasSize {
+                let alpha = shadow[shadowY * canvasSize + x] * options.shadowOpacity
+                over(0, 0, 0, alpha, &color)
+            }
+            let outlineAlpha = Float(outline[pixel]) / 255
+            over(1, 1, 1, outlineAlpha, &color)
+
+            let subjectAlpha = Float(scaled.mask[pixel]) / 255
+            let oldAlpha = Float(scaled.originalAlpha[pixel]) / 255
+            let byte = pixel * 4
+            let divisor = max(oldAlpha, 1 / 255)
+            let red = min(1, Float(scaled.rgba[byte]) / 255 / divisor)
+            let green = min(1, Float(scaled.rgba[byte + 1]) / 255 / divisor)
+            let blue = min(1, Float(scaled.rgba[byte + 2]) / 255 / divisor)
+            over(red, green, blue, subjectAlpha, &color)
+
+            output[byte] = UInt8(clamping: Int((color.r * 255).rounded()))
+            output[byte + 1] = UInt8(clamping: Int((color.g * 255).rounded()))
+            output[byte + 2] = UInt8(clamping: Int((color.b * 255).rounded()))
+            output[byte + 3] = UInt8(clamping: Int((color.a * 255).rounded()))
+        }
+    }
+
+    let data = Data(output) as CFData
+    guard let provider = CGDataProvider(data: data),
+          let result = CGImage(
+            width: canvasSize, height: canvasSize,
+            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: canvasSize * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
+          ) else { throw StickerfyError.processing("could not render the sticker") }
+    return result
+}
+
+func replaceFile(at destination: URL, with temporary: URL) throws {
+    let manager = FileManager.default
+    if manager.fileExists(atPath: destination.path) { try manager.removeItem(at: destination) }
+    try manager.moveItem(at: temporary, to: destination)
+}
+
+func writeSticker(_ image: CGImage, to pngDestination: URL) throws -> URL {
+    let manager = FileManager.default
+    let temporary = pngDestination.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).png")
+    guard let writer = CGImageDestinationCreateWithURL(temporary as CFURL, UTType.png.identifier as CFString, 1, nil) else {
+        throw StickerfyError.processing("could not create PNG output")
+    }
+    CGImageDestinationAddImage(writer, image, [kCGImagePropertyPNGDictionary: [:]] as CFDictionary)
+    guard CGImageDestinationFinalize(writer) else {
+        try? manager.removeItem(at: temporary)
+        throw StickerfyError.processing("could not write \(pngDestination.lastPathComponent)")
+    }
+    let size = (try? temporary.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+    if size <= telegramLimit {
+        try replaceFile(at: pngDestination, with: temporary)
+        return pngDestination
+    }
+
+    // Detailed photographs can exceed Telegram's 512 KB limit as PNG. WebP is
+    // also an official static-sticker format, so progressively compress only
+    // those large results. cwebp is installed by this repo's init command.
+    let webpDestination = pngDestination.deletingPathExtension().appendingPathExtension("webp")
+    let temporaryWebP = pngDestination.deletingLastPathComponent().appendingPathComponent(".\(UUID().uuidString).webp")
+    defer {
+        try? manager.removeItem(at: temporary)
+        try? manager.removeItem(at: temporaryWebP)
+    }
+    for quality in [90, 80, 70, 60, 50, 40, 30] {
+        try? manager.removeItem(at: temporaryWebP)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        task.arguments = [
+            "cwebp", "-quiet", "-q", String(quality), "-m", "6", "-alpha_q", "100",
+            temporary.path, "-o", temporaryWebP.path,
+        ]
+        let errors = Pipe()
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = errors
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            throw StickerfyError.processing(
+                "the PNG exceeds 512 KB and cwebp is unavailable for the WebP fallback; run ~/.myhome/manage.sh --init"
+            )
+        }
+        guard task.terminationStatus == 0 else {
+            let data = errors.fileHandleForReading.readDataToEndOfFile()
+            let detail = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw StickerfyError.processing("cwebp could not create the WebP fallback: \(detail ?? "unknown error")")
+        }
+        let webpSize = (try? temporaryWebP.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
+        if webpSize <= telegramLimit {
+            try replaceFile(at: webpDestination, with: temporaryWebP)
+            return webpDestination
+        }
+    }
+    throw StickerfyError.processing("could not compress the sticker below Telegram's 512 KB limit")
+}
+
+func outputURL(for input: URL, options: Options) throws -> URL {
+    let folder: URL
+    if let explicit = options.outputDirectory {
+        folder = URL(fileURLWithPath: NSString(string: explicit).expandingTildeInPath).standardizedFileURL
+    } else {
+        folder = input.deletingLastPathComponent().appendingPathComponent("Stickers", isDirectory: true)
+    }
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    var destination = folder.appendingPathComponent(input.deletingPathExtension().lastPathComponent + ".png")
+    if destination.standardizedFileURL == input.standardizedFileURL {
+        destination = folder.appendingPathComponent(input.deletingPathExtension().lastPathComponent + "-sticker.png")
+    }
+    return destination
+}
+
+func makeSticker(input: URL, options: Options) throws -> URL {
+    let image = try loadImage(input)
+    let rgba = try rgbaBytes(of: image)
+    let useExistingAlpha = hasUsefulTransparency(rgba)
+    let mask: [UInt8]
+    if useExistingAlpha || options.keepBackground {
+        mask = originalAlpha(from: rgba)
+    } else {
+        mask = try visionMask(for: image)
+    }
+    let bounds = try contentBounds(mask: mask, width: image.width, height: image.height)
+    let scaled = try scaleToCanvas(image: image, mask: mask, bounds: bounds, options: options)
+    let sticker = try renderSticker(scaled: scaled, options: options)
+    let destination = try outputURL(for: input, options: options)
+    return try writeSticker(sticker, to: destination)
+}
+
+func notify(title: String, message: String) {
+    let script = "display notification \"\(message.replacingOccurrences(of: "\"", with: "\\\""))\" with title \"\(title)\""
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+    task.arguments = ["-e", script]
+    task.standardOutput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    try? task.run()
+    task.waitUntilExit()
+}
+
+do {
+    let options = try parseArguments()
+    let inputs = try expandedInputURLs(options.inputs)
+    var outputs: [URL] = []
+    var failures: [String] = []
+    for input in inputs {
+        do {
+            let output = try makeSticker(input: input, options: options)
+            outputs.append(output)
+            print(output.path)
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            failures.append("\(input.lastPathComponent): \(detail)")
+            fputs("stickerfy: \(input.lastPathComponent): \(detail)\n", stderr)
+        }
+    }
+    if options.notify {
+        let message = failures.isEmpty
+            ? "\(outputs.count) sticker\(outputs.count == 1 ? "" : "s") ready"
+            : "\(outputs.count) ready, \(failures.count) failed"
+        notify(title: failures.isEmpty ? "Stickers created" : "Stickerfy finished", message: message)
+    }
+    exit(failures.isEmpty ? 0 : 1)
+} catch {
+    let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    fputs("stickerfy: \(detail)\n", stderr)
+    exit(2)
+}

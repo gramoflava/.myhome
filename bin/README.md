@@ -13,6 +13,7 @@ This directory contains helper utilities for common repetitive tasks. These scri
 - **png2icns.py** - Converts PNG images to macOS .icns icon format
 - **bigsync** - Robust, resumable directory sync over SSH with smart defaults
 - **bookcompile** - Compiles selected Markdown files into a full Markdown manuscript, EPUB, and Word DOCX
+- **stickerfy** - Turns selected images into Telegram-ready stickers using local Apple Vision subject extraction
 
 ## Requirements
 
@@ -56,3 +57,32 @@ finishes. All selected chapters must belong to the same folder.
 
 EPUB and DOCX conversion uses Pandoc, installed by `~/.myhome/manage.sh --init`.
 The combined Markdown export needs only Python 3.
+
+### stickerfy
+
+Select one or more images in Finder and pass them as arguments:
+
+```sh
+stickerfy photo.jpg drawing.png
+```
+
+Transparent images keep their alpha channel. Opaque images use Apple's on-device
+subject extraction, then receive a white border and soft black shadow. The command
+writes 512 × 512 transparent PNG files to a `Stickers` folder beside each input.
+If a detailed PNG would exceed Telegram's 512 KB limit, it automatically falls
+back to WebP using cwebp. It requires macOS 14 or newer for automatic background
+removal, and processing never sends an image over the network.
+
+For a Finder Quick Action in Automator:
+
+1. Choose “Workflow receives current: image files” in Finder.
+2. Add “Run Shell Script”, choose `/bin/zsh`, and pass input “as arguments”.
+3. Use:
+
+```sh
+source "$HOME/.zprofile"
+stickerfy "$@"
+```
+
+The command is non-interactive and shows a macOS notification when processing
+finishes. Run `stickerfy --help` for border, shadow, margin, and output options.

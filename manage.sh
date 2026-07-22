@@ -190,10 +190,12 @@ init() {
             ripgrep   "Fast grep alternative"
             tree      "Directory structure viewer"
             jq        "JSON processor"
+            libtiff   "TIFF support used by the WebP encoder"
             tig       "Text-mode interface for git"
             zsh-completions "Additional completions"
             ffmpeg    "Media processor"
             pandoc    "Document converter for EPUB and Word exports"
+            webp      "WebP encoder for Telegram sticker size fallback"
         )
 
         # Init or install Homebrew if missing
