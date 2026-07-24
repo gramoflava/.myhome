@@ -66,9 +66,14 @@ Select one or more images in Finder and pass them as arguments:
 stickerfy photo.jpg drawing.png
 ```
 
-Transparent images keep their alpha channel. Opaque images use Apple's on-device
-subject extraction, then receive a white border and soft black shadow. The command
-writes 512 × 512 transparent PNG files to a `Stickers` folder beside each input.
+Each input produces two versions with a white border and soft black shadow:
+`name-full.png` preserves the image as supplied, including its background, while
+`name-cutout.png` uses Apple's on-device subject extraction to remove an opaque
+background. Existing transparency is preserved in both. The command writes the
+results to a `Stickers` folder beside each input. The longest side is exactly
+512 pixels; the shorter side is tightly calculated from the content, border,
+and shadow rather than padded to a square. Use `--full-only` or `--cutout-only`
+when only one version is wanted.
 If a detailed PNG would exceed Telegram's 512 KB limit, it automatically falls
 back to WebP using cwebp. It requires macOS 14 or newer for automatic background
 removal, and processing never sends an image over the network.

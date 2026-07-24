@@ -24,16 +24,46 @@ import Vision
 let canvasSize = 512
 let telegramLimit = 512 * 1024
 
+enum StickerVersion: String {
+    case full
+    case cutout
+}
+
 struct Options {
     var inputs: [String] = []
     var outputDirectory: String?
-    var margin = 26
+    var margin = 0
     var border = 7
     var shadowBlur = 6
     var shadowOffset = 4
     var shadowOpacity: Float = 0.28
-    var keepBackground = false
+    var versions: [StickerVersion] = [.full, .cutout]
     var notify = true
+}
+
+struct EffectInsets {
+    let left: Int
+    let right: Int
+    let lower: Int
+    let upper: Int
+}
+
+func shadowBoxRadius(_ options: Options) -> Int {
+    options.shadowBlur > 0 ? max(1, Int(round(Double(options.shadowBlur) * 0.58))) : 0
+}
+
+func effectInsets(_ options: Options) -> EffectInsets {
+    // The Gaussian approximation is three box-blur passes, so its support is
+    // exactly three box radii. Allocate only the pixels the rendered effect can
+    // actually touch; --margin adds deliberate extra breathing room.
+    let blurExtent = shadowBoxRadius(options) * 3
+    let base = options.margin + options.border + blurExtent
+    return EffectInsets(
+        left: base,
+        right: base,
+        lower: base + max(0, -options.shadowOffset),
+        upper: base + max(0, options.shadowOffset)
+    )
 }
 
 enum StickerfyError: LocalizedError {
@@ -51,18 +81,21 @@ func usage() -> String {
     """
     Usage: stickerfy [options] IMAGE [IMAGE ...]
 
-    Turn images into Telegram-compatible 512 x 512 PNG stickers. Images with
-    transparency keep their alpha; opaque images use Apple's on-device subject
-    extraction. Results are written to a Stickers folder beside the inputs.
+    Turn images into two Telegram-compatible stickers whose longest side is
+    exactly 512 pixels: "-full"
+    preserves the image as supplied, while "-cutout" removes an opaque
+    background with Apple's on-device subject extraction. Existing transparency
+    is preserved. Results are written to a Stickers folder beside the inputs.
 
     Options:
       -o, --output-dir DIR    Write every result to DIR
-          --margin PX        Clear outer margin (default: 26)
+          --margin PX        Extra clear margin beyond the shadow (default: 0)
           --border PX        White border width (default: 7)
           --shadow-blur PX   Shadow softness (default: 6)
           --shadow-offset PX Downward shadow offset (default: 4)
           --shadow-opacity N Shadow opacity, 0...1 (default: 0.28)
-          --keep-background  Keep opaque images rectangular
+          --full-only        Create only the version with the original background
+          --cutout-only      Create only the background-removed version
           --no-notify        Do not show the macOS completion notification
       -h, --help             Show this help
 
@@ -122,7 +155,8 @@ func parseArguments() throws -> Options {
                 throw StickerfyError.usage("--shadow-opacity must be between 0 and 1")
             }
             options.shadowOpacity = number
-        case "--keep-background": options.keepBackground = true
+        case "--full-only", "--keep-background": options.versions = [.full]
+        case "--cutout-only": options.versions = [.cutout]
         case "--no-notify": options.notify = false
         case "--":
             options.inputs.append(contentsOf: arguments.dropFirst(index + 1))
@@ -140,7 +174,9 @@ func parseArguments() throws -> Options {
     guard !options.inputs.isEmpty else {
         throw StickerfyError.usage("no images selected\n\n\(usage())")
     }
-    guard options.margin + options.border + options.shadowBlur + abs(options.shadowOffset) < 220 else {
+    let insets = effectInsets(options)
+    guard insets.left + insets.right < canvasSize,
+          insets.lower + insets.upper < canvasSize else {
         throw StickerfyError.usage("margin, border, and shadow leave no room for the image")
     }
     return options
@@ -319,19 +355,42 @@ func grayscaleImage(bytes: [UInt8], width: Int, height: Int) throws -> CGImage {
     return image
 }
 
+struct ScaledSticker {
+    let rgba: [UInt8]
+    let originalAlpha: [UInt8]
+    let mask: [UInt8]
+    let width: Int
+    let height: Int
+}
+
 func scaleToCanvas(
     image: CGImage,
     mask: [UInt8],
     bounds: Bounds,
     options: Options
-) throws -> (rgba: [UInt8], originalAlpha: [UInt8], mask: [UInt8]) {
-    let reserved = options.margin + options.border + options.shadowBlur + max(0, options.shadowOffset)
-    let available = canvasSize - reserved * 2
-    let scale = min(Double(available) / Double(bounds.width), Double(available) / Double(bounds.height))
-    let targetWidth = max(1, Int((Double(bounds.width) * scale).rounded()))
-    let targetHeight = max(1, Int((Double(bounds.height) * scale).rounded()))
-    let destinationX = (canvasSize - targetWidth) / 2
-    let destinationY = (canvasSize - targetHeight) / 2 + options.shadowOffset / 2
+) throws -> ScaledSticker {
+    let insets = effectInsets(options)
+    let availableWidth = canvasSize - insets.left - insets.right
+    let availableHeight = canvasSize - insets.lower - insets.upper
+    let widthScale = Double(availableWidth) / Double(bounds.width)
+    let heightScale = Double(availableHeight) / Double(bounds.height)
+    let scale = min(widthScale, heightScale)
+
+    // Make the limiting content dimension exact so the corresponding rendered
+    // dimension, including border and shadow, is guaranteed to equal 512.
+    let targetWidth: Int
+    let targetHeight: Int
+    if widthScale <= heightScale {
+        targetWidth = availableWidth
+        targetHeight = max(1, min(availableHeight, Int((Double(bounds.height) * scale).rounded(.down))))
+    } else {
+        targetWidth = max(1, min(availableWidth, Int((Double(bounds.width) * scale).rounded(.down))))
+        targetHeight = availableHeight
+    }
+    let outputWidth = targetWidth + insets.left + insets.right
+    let outputHeight = targetHeight + insets.lower + insets.upper
+    let destinationX = insets.left
+    let destinationY = insets.lower
 
     guard let croppedImage = image.cropping(to: CGRect(x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height)),
           let fullMaskImage = try? grayscaleImage(bytes: mask, width: image.width, height: image.height),
@@ -339,12 +398,12 @@ func scaleToCanvas(
         throw StickerfyError.processing("could not crop the subject")
     }
 
-    var scaledRGBA = [UInt8](repeating: 0, count: canvasSize * canvasSize * 4)
+    var scaledRGBA = [UInt8](repeating: 0, count: outputWidth * outputHeight * 4)
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     let drewColor = scaledRGBA.withUnsafeMutableBytes { raw -> Bool in
         guard let context = CGContext(
-            data: raw.baseAddress, width: canvasSize, height: canvasSize,
-            bitsPerComponent: 8, bytesPerRow: canvasSize * 4, space: colorSpace,
+            data: raw.baseAddress, width: outputWidth, height: outputHeight,
+            bitsPerComponent: 8, bytesPerRow: outputWidth * 4, space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
         ) else { return false }
         context.interpolationQuality = .high
@@ -353,11 +412,11 @@ func scaleToCanvas(
     }
     guard drewColor else { throw StickerfyError.processing("could not resize the image") }
 
-    var scaledMask = [UInt8](repeating: 0, count: canvasSize * canvasSize)
+    var scaledMask = [UInt8](repeating: 0, count: outputWidth * outputHeight)
     let drewMask = scaledMask.withUnsafeMutableBytes { raw -> Bool in
         guard let context = CGContext(
-            data: raw.baseAddress, width: canvasSize, height: canvasSize,
-            bitsPerComponent: 8, bytesPerRow: canvasSize, space: CGColorSpaceCreateDeviceGray(),
+            data: raw.baseAddress, width: outputWidth, height: outputHeight,
+            bitsPerComponent: 8, bytesPerRow: outputWidth, space: CGColorSpaceCreateDeviceGray(),
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else { return false }
         context.interpolationQuality = .high
@@ -367,76 +426,87 @@ func scaleToCanvas(
     guard drewMask else { throw StickerfyError.processing("could not resize the subject mask") }
 
     let scaledOriginalAlpha = originalAlpha(from: scaledRGBA)
-    return (scaledRGBA, scaledOriginalAlpha, scaledMask)
+    return ScaledSticker(
+        rgba: scaledRGBA,
+        originalAlpha: scaledOriginalAlpha,
+        mask: scaledMask,
+        width: outputWidth,
+        height: outputHeight
+    )
 }
 
-func maximumFilter(_ input: [UInt8], radius: Int) -> [UInt8] {
+func maximumFilter(_ input: [UInt8], radius: Int, width: Int, height: Int) -> [UInt8] {
     guard radius > 0 else { return input }
-    let size = canvasSize
     var horizontal = [UInt8](repeating: 0, count: input.count)
     var output = [UInt8](repeating: 0, count: input.count)
-    for y in 0..<size {
-        for x in 0..<size {
+    for y in 0..<height {
+        for x in 0..<width {
             var value: UInt8 = 0
-            for xx in max(0, x - radius)...min(size - 1, x + radius) {
-                value = max(value, input[y * size + xx])
+            for xx in max(0, x - radius)...min(width - 1, x + radius) {
+                value = max(value, input[y * width + xx])
             }
-            horizontal[y * size + x] = value
+            horizontal[y * width + x] = value
         }
     }
-    for y in 0..<size {
-        for x in 0..<size {
+    for y in 0..<height {
+        for x in 0..<width {
             var value: UInt8 = 0
-            for yy in max(0, y - radius)...min(size - 1, y + radius) {
-                value = max(value, horizontal[yy * size + x])
+            for yy in max(0, y - radius)...min(height - 1, y + radius) {
+                value = max(value, horizontal[yy * width + x])
             }
-            output[y * size + x] = value
+            output[y * width + x] = value
         }
     }
     return output
 }
 
-func boxBlur(_ input: [Float], radius: Int) -> [Float] {
+func boxBlur(_ input: [Float], radius: Int, width: Int, height: Int) -> [Float] {
     guard radius > 0 else { return input }
-    let size = canvasSize
     var horizontal = [Float](repeating: 0, count: input.count)
     var output = [Float](repeating: 0, count: input.count)
-    for y in 0..<size {
+    for y in 0..<height {
         var sum: Float = 0
-        for x in -radius...radius where x >= 0 && x < size { sum += input[y * size + x] }
-        for x in 0..<size {
-            horizontal[y * size + x] = sum / Float(min(size - 1, x + radius) - max(0, x - radius) + 1)
+        for x in -radius...radius where x >= 0 && x < width { sum += input[y * width + x] }
+        for x in 0..<width {
+            horizontal[y * width + x] = sum / Float(min(width - 1, x + radius) - max(0, x - radius) + 1)
             let leaving = x - radius
             let entering = x + radius + 1
-            if leaving >= 0 { sum -= input[y * size + leaving] }
-            if entering < size { sum += input[y * size + entering] }
+            if leaving >= 0 { sum -= input[y * width + leaving] }
+            if entering < width { sum += input[y * width + entering] }
         }
     }
-    for x in 0..<size {
+    for x in 0..<width {
         var sum: Float = 0
-        for y in -radius...radius where y >= 0 && y < size { sum += horizontal[y * size + x] }
-        for y in 0..<size {
-            output[y * size + x] = sum / Float(min(size - 1, y + radius) - max(0, y - radius) + 1)
+        for y in -radius...radius where y >= 0 && y < height { sum += horizontal[y * width + x] }
+        for y in 0..<height {
+            output[y * width + x] = sum / Float(min(height - 1, y + radius) - max(0, y - radius) + 1)
             let leaving = y - radius
             let entering = y + radius + 1
-            if leaving >= 0 { sum -= horizontal[leaving * size + x] }
-            if entering < size { sum += horizontal[entering * size + x] }
+            if leaving >= 0 { sum -= horizontal[leaving * width + x] }
+            if entering < height { sum += horizontal[entering * width + x] }
         }
     }
     return output
 }
 
 func renderSticker(
-    scaled: (rgba: [UInt8], originalAlpha: [UInt8], mask: [UInt8]),
+    scaled: ScaledSticker,
     options: Options
 ) throws -> CGImage {
-    let outline = maximumFilter(scaled.mask, radius: options.border)
+    let outline = maximumFilter(
+        scaled.mask,
+        radius: options.border,
+        width: scaled.width,
+        height: scaled.height
+    )
     var shadow = outline.map { Float($0) / 255 }
     if options.shadowBlur > 0 {
-        let boxRadius = max(1, Int(round(Double(options.shadowBlur) * 0.58)))
-        for _ in 0..<3 { shadow = boxBlur(shadow, radius: boxRadius) }
+        let boxRadius = shadowBoxRadius(options)
+        for _ in 0..<3 {
+            shadow = boxBlur(shadow, radius: boxRadius, width: scaled.width, height: scaled.height)
+        }
     }
-    var output = [UInt8](repeating: 0, count: canvasSize * canvasSize * 4)
+    var output = [UInt8](repeating: 0, count: scaled.width * scaled.height * 4)
 
     func over(_ sourceR: Float, _ sourceG: Float, _ sourceB: Float, _ sourceA: Float,
               _ destination: inout (r: Float, g: Float, b: Float, a: Float)) {
@@ -447,13 +517,13 @@ func renderSticker(
         destination.a = sourceA + destination.a * inverse
     }
 
-    for y in 0..<canvasSize {
-        for x in 0..<canvasSize {
-            let pixel = y * canvasSize + x
+    for y in 0..<scaled.height {
+        for x in 0..<scaled.width {
+            let pixel = y * scaled.width + x
             var color: (r: Float, g: Float, b: Float, a: Float) = (0, 0, 0, 0)
             let shadowY = y - options.shadowOffset
-            if shadowY >= 0 && shadowY < canvasSize {
-                let alpha = shadow[shadowY * canvasSize + x] * options.shadowOpacity
+            if shadowY >= 0 && shadowY < scaled.height {
+                let alpha = shadow[shadowY * scaled.width + x] * options.shadowOpacity
                 over(0, 0, 0, alpha, &color)
             }
             let outlineAlpha = Float(outline[pixel]) / 255
@@ -478,8 +548,8 @@ func renderSticker(
     let data = Data(output) as CFData
     guard let provider = CGDataProvider(data: data),
           let result = CGImage(
-            width: canvasSize, height: canvasSize,
-            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: canvasSize * 4,
+            width: scaled.width, height: scaled.height,
+            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: scaled.width * 4,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
             provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent
@@ -552,7 +622,7 @@ func writeSticker(_ image: CGImage, to pngDestination: URL) throws -> URL {
     throw StickerfyError.processing("could not compress the sticker below Telegram's 512 KB limit")
 }
 
-func outputURL(for input: URL, options: Options) throws -> URL {
+func outputURL(for input: URL, version: StickerVersion, options: Options) throws -> URL {
     let folder: URL
     if let explicit = options.outputDirectory {
         folder = URL(fileURLWithPath: NSString(string: explicit).expandingTildeInPath).standardizedFileURL
@@ -560,28 +630,42 @@ func outputURL(for input: URL, options: Options) throws -> URL {
         folder = input.deletingLastPathComponent().appendingPathComponent("Stickers", isDirectory: true)
     }
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    var destination = folder.appendingPathComponent(input.deletingPathExtension().lastPathComponent + ".png")
+    let outputName = input.deletingPathExtension().lastPathComponent + "-\(version.rawValue).png"
+    var destination = folder.appendingPathComponent(outputName)
     if destination.standardizedFileURL == input.standardizedFileURL {
         destination = folder.appendingPathComponent(input.deletingPathExtension().lastPathComponent + "-sticker.png")
     }
     return destination
 }
 
-func makeSticker(input: URL, options: Options) throws -> URL {
+func makeStickers(input: URL, options: Options) throws -> (outputs: [URL], failures: [String]) {
     let image = try loadImage(input)
     let rgba = try rgbaBytes(of: image)
     let useExistingAlpha = hasUsefulTransparency(rgba)
-    let mask: [UInt8]
-    if useExistingAlpha || options.keepBackground {
-        mask = originalAlpha(from: rgba)
-    } else {
-        mask = try visionMask(for: image)
+    let suppliedAlpha = originalAlpha(from: rgba)
+    var outputs: [URL] = []
+    var failures: [String] = []
+
+    for version in options.versions {
+        do {
+            let mask: [UInt8]
+            switch version {
+            case .full:
+                mask = suppliedAlpha
+            case .cutout:
+                mask = useExistingAlpha ? suppliedAlpha : try visionMask(for: image)
+            }
+            let bounds = try contentBounds(mask: mask, width: image.width, height: image.height)
+            let scaled = try scaleToCanvas(image: image, mask: mask, bounds: bounds, options: options)
+            let sticker = try renderSticker(scaled: scaled, options: options)
+            let destination = try outputURL(for: input, version: version, options: options)
+            outputs.append(try writeSticker(sticker, to: destination))
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            failures.append("\(input.lastPathComponent) [\(version.rawValue)]: \(detail)")
+        }
     }
-    let bounds = try contentBounds(mask: mask, width: image.width, height: image.height)
-    let scaled = try scaleToCanvas(image: image, mask: mask, bounds: bounds, options: options)
-    let sticker = try renderSticker(scaled: scaled, options: options)
-    let destination = try outputURL(for: input, options: options)
-    return try writeSticker(sticker, to: destination)
+    return (outputs, failures)
 }
 
 func notify(title: String, message: String) {
@@ -602,9 +686,11 @@ do {
     var failures: [String] = []
     for input in inputs {
         do {
-            let output = try makeSticker(input: input, options: options)
-            outputs.append(output)
-            print(output.path)
+            let result = try makeStickers(input: input, options: options)
+            outputs.append(contentsOf: result.outputs)
+            failures.append(contentsOf: result.failures)
+            for output in result.outputs { print(output.path) }
+            for failure in result.failures { fputs("stickerfy: \(failure)\n", stderr) }
         } catch {
             let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             failures.append("\(input.lastPathComponent): \(detail)")
